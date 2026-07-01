@@ -949,7 +949,11 @@ def weighted_rigid_align(x, x_gt, w, mask):
     mu_gt = mx.sum(x_gt * w, axis=-2, keepdims=True) / denom
     x_c, xgt_c = x - mu, x_gt - mu_gt
     H = (w * xgt_c).transpose(0, 2, 1) @ x_c  # (B, 3, 3)
-    U, _, Vh = mx.linalg.svd(H.astype(mx.float32), stream=mx.cpu)
+    H32 = H.astype(mx.float32)
+    # Guard: LAPACK sgesvdx aborts (uncatchable C++ terminate) on NaN/Inf input.
+    # Sanitize so an upstream overflow surfaces as NaN coords instead of a crash.
+    H32 = mx.where(mx.isnan(H32) | mx.isinf(H32), mx.zeros_like(H32), H32)
+    U, _, Vh = mx.linalg.svd(H32, stream=mx.cpu)
     det = _det3(U @ Vh)
     ones = mx.ones_like(det)
     D = mx.zeros((*det.shape, 3, 3))
