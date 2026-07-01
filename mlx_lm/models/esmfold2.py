@@ -1159,7 +1159,7 @@ class ConfidenceHead(nn.Module):
 
     def __init__(self, d_single=384, d_pair=256, d_inputs=451, distogram_bins=128,
                  min_dist=2.0, max_dist=52.0, num_plddt_bins=50, num_pae_bins=64,
-                 n_trunk_layers=4, max_atoms_per_token=23):
+                 num_pde_bins=64, n_trunk_layers=4, max_atoms_per_token=23):
         super().__init__()
         self.boundaries = mx.linspace(min_dist, max_dist, distogram_bins - 1)
         self.dist_bin_pairwise_embed = nn.Embedding(distogram_bins, d_pair)
@@ -1177,7 +1177,12 @@ class ConfidenceHead(nn.Module):
         self.folding_trunk = FoldingTrunk(n_layers=n_trunk_layers, d_pair=d_pair)
         self.plddt_ln = nn.LayerNorm(d_single)
         self.plddt_weight = mx.zeros((max_atoms_per_token, d_single, num_plddt_bins))
+        self.pae_ln = nn.LayerNorm(d_pair)
         self.pae_head = nn.Linear(d_pair, num_pae_bins, bias=False)
+        self.pde_ln = nn.LayerNorm(d_pair)
+        self.pde_head = nn.Linear(d_pair, num_pde_bins, bias=False)
+        self.resolved_ln = nn.LayerNorm(d_single)
+        self.resolved_weight = mx.zeros((max_atoms_per_token, d_single, 2))
 
     def __call__(self, s_inputs, z, x_pred, distogram_atom_idx, token_attention_mask,
                  atom_to_token, atom_attention_mask, asym_id, mol_type,
@@ -1206,7 +1211,8 @@ class ConfidenceHead(nn.Module):
         single = self.row_attention_pooling(pair, mask)
 
         atom_mask_f = atom_attention_mask.astype(mx.float32)
-        s_at = self.plddt_ln(gather_token_to_atom(single, atom_to_token.astype(mx.int32)))
+        s_at_atoms = gather_token_to_atom(single, atom_to_token.astype(mx.int32))
+        s_at = self.plddt_ln(s_at_atoms)
         intra = mx.minimum(_intra_token_idx(atom_to_token), self.plddt_weight.shape[0] - 1)
         B, A = atom_to_token.shape
         w = mx.take(self.plddt_weight, intra.reshape(-1), axis=0).reshape(
@@ -1222,8 +1228,16 @@ class ConfidenceHead(nn.Module):
         complex_plddt = mx.sum(plddt_per_atom * atom_mask_f, axis=-1) / (mx.sum(atom_mask_f, axis=-1) + _EPS)
         plddt_ca = mx.take_along_axis(plddt_per_atom, rep_idx, axis=1)
 
-        pae_logits = self.pae_head(pair)
+        pae_logits = self.pae_head(self.pae_ln(pair))
         pae = _categorical_mean(pae_logits, 0.0, 32.0)
+
+        pde_logits = self.pde_head(self.pde_ln(pair))
+        pde = _categorical_mean(pde_logits, 0.0, 32.0)
+
+        s_at_res = self.resolved_ln(s_at_atoms)
+        w_res = mx.take(self.resolved_weight, intra.reshape(-1), axis=0).reshape(
+            B, A, self.resolved_weight.shape[1], self.resolved_weight.shape[2])
+        resolved_logits = mx.sum(s_at_res[..., :, None] * w_res, axis=-2)  # (B, A, 2)
 
         n_bins = pae_logits.shape[-1]
         bw = 32.0 / n_bins
@@ -1243,7 +1257,10 @@ class ConfidenceHead(nn.Module):
         return {
             "plddt": plddt, "plddt_per_atom": plddt_per_atom, "plddt_ca": plddt_ca,
             "complex_plddt": complex_plddt, "plddt_logits": plddt_logits,
-            "pae_logits": pae_logits, "pae": pae, "ptm": ptm, "iptm": iptm,
+            "pae_logits": pae_logits, "pae": pae,
+            "pde_logits": pde_logits, "pde": pde,
+            "resolved_logits": resolved_logits,
+            "ptm": ptm, "iptm": iptm,
         }
 
 
@@ -1446,6 +1463,24 @@ class ESMFold2Model(nn.Module):
         else:
             self.msa_encoder = None
 
+        # Confidence head (opt-in). Built when the config carries a
+        # `confidence_head` section so its weights load 1:1; running it is
+        # gated behind `confidence()` / `fold(return_confidence=True)` so the
+        # default coords path (and its timing) is unchanged.
+        cc = config.get("confidence_head", {}) or {}
+        if cc.get("enabled", False):
+            ct = cc.get("folding_trunk", {}) or {}
+            self.confidence_head = ConfidenceHead(
+                d_single=config["d_single"], d_pair=d_pair, d_inputs=d_inputs,
+                distogram_bins=cc.get("distogram_bins", 128),
+                min_dist=cc.get("min_dist", 2.0), max_dist=cc.get("max_dist", 52.0),
+                num_plddt_bins=cc.get("num_plddt_bins", 50),
+                num_pae_bins=cc.get("num_pae_bins", 64),
+                num_pde_bins=cc.get("num_pde_bins", 64),
+                n_trunk_layers=ct.get("n_layers", 4))
+        else:
+            self.confidence_head = None
+
     def _dynamics(self):
         delta = _softplus(self.parcae_log_delta)
         a = mx.exp(-delta * mx.exp(self.parcae_log_a)).reshape(1, 1, 1, -1)
@@ -1523,8 +1558,29 @@ class ESMFold2Model(nn.Module):
     def distogram(self, z):
         return self.distogram_head(z + z.transpose(0, 2, 1, 3))
 
+    def confidence(self, feats, z, x_inputs, aux, coords, num_diffusion_samples=1):
+        """Run the confidence head on already-computed trunk/structure outputs.
+
+        Returns {plddt, plddt_ca, complex_plddt, pae, pde, ptm, iptm, ...}.
+        Requires the model to have been built with a `confidence_head` section
+        in the config (biohub/ESMFold2* have `confidence_head.enabled=True`).
+        """
+        if self.confidence_head is None:
+            raise RuntimeError(
+                "confidence_head not built; config has no enabled confidence_head section")
+        token_bonds_encoding = self.token_bonds(feats["token_bonds"].astype(mx.float32))
+        return self.confidence_head(
+            s_inputs=x_inputs, z=z.astype(mx.float32), x_pred=coords,
+            distogram_atom_idx=feats["distogram_atom_idx"].astype(mx.int32),
+            token_attention_mask=aux["tok_mask"],
+            atom_to_token=aux["atom_to_token"],
+            atom_attention_mask=aux["ref_mask"],
+            asym_id=feats["asym_id"], mol_type=feats["mol_type"],
+            relative_position_encoding=aux["relpos"],
+            token_bonds_encoding=token_bonds_encoding)
+
     def fold(self, feats, lm_hidden_states=None, num_loops=3, num_sampling_steps=50,
-             num_diffusion_samples=1, z0=None):
+             num_diffusion_samples=1, z0=None, return_confidence=False):
         z, x_inputs, aux = self.trunk(feats, lm_hidden_states, z0=z0, num_loops=num_loops)
         coords = self.structure_head.sample(
             z_trunk=z, s_inputs=x_inputs, relative_position_encoding=aux["relpos"],
@@ -1533,18 +1589,18 @@ class ESMFold2Model(nn.Module):
             ref_space_uid=aux["ref_space_uid"], tok_idx=aux["atom_to_token"],
             n_tokens=aux["n_tokens"], token_attention_mask=aux["tok_mask"],
             num_diffusion_samples=num_diffusion_samples, num_sampling_steps=num_sampling_steps)
-        return {"sample_atom_coords": coords, "distogram_logits": self.distogram(z)}
+        out = {"sample_atom_coords": coords, "distogram_logits": self.distogram(z)}
+        if return_confidence:
+            out.update(self.confidence(feats, z, x_inputs, aux, coords,
+                                       num_diffusion_samples=num_diffusion_samples))
+        return out
 
 
 def sanitize_esmfold2(weights: dict) -> dict:
-    """Strip `._engine.`; drop confidence_head.* and msa_encoder.* (unused in the
-    single-sequence coords path; msa_encoder only fires when an MSA is provided)."""
-    out = {}
-    for k, v in weights.items():
-        if k.startswith("confidence_head."):
-            continue
-        out[k.replace("._engine.", ".")] = v
-    return out
+    """Strip the reference's `._engine.` trimul wrapper segment. `confidence_head.*`
+    keys are kept (they map 1:1 onto the opt-in ConfidenceHead built when the config
+    enables it); msa_encoder.* keys are likewise kept when that module is built."""
+    return {k.replace("._engine.", "."): v for k, v in weights.items()}
 
 
 def sanitize_trunk(weights: dict) -> dict:
