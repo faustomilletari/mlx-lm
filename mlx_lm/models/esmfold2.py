@@ -265,6 +265,11 @@ class RelativePositionEncoding(nn.Module):
 # F.rms_norm with eps=None uses finfo(float32).eps for fp32 inputs.
 _RMS_EPS_F32 = 1.1920929e-07
 
+# The reference forces bf16 inside the SWA atom attention. Exposed as a global
+# so we can test whether that precision is what over-disperses the full model's
+# stochastic (noise_scale>0) diffusion churn.
+_SWA_DTYPE = mx.bfloat16
+
 
 def _rms_norm(x: mx.array, eps: float = _RMS_EPS_F32) -> mx.array:
     return x * mx.rsqrt(mx.mean(x.astype(mx.float32) ** 2, axis=-1, keepdims=True) + eps).astype(x.dtype)
@@ -317,7 +322,7 @@ def build_3d_rope(
         freqs = mx.concatenate(
             [freqs, mx.zeros((B, N, half_dim - n_active), dtype=mx.float32)], axis=-1
         )
-    return mx.cos(freqs).astype(mx.bfloat16), mx.sin(freqs).astype(mx.bfloat16)
+    return mx.cos(freqs).astype(_SWA_DTYPE), mx.sin(freqs).astype(_SWA_DTYPE)
 
 
 class SWA3DRoPEAttention(nn.Module):
@@ -343,7 +348,7 @@ class SWA3DRoPEAttention(nn.Module):
         k = apply_rotary_emb_3d(k, cos, sin)
 
         input_dtype = q.dtype
-        q, k, v = (t.astype(mx.bfloat16) for t in (q, k, v))
+        q, k, v = (t.astype(_SWA_DTYPE) for t in (q, k, v))
 
         # Rank-based sliding-window mask over valid atoms (reference no-flash path).
         if valid is None:
@@ -1239,6 +1244,112 @@ class ConfidenceHead(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# MSA encoder (full model only; conditions the pair on the query MSA)
+# ---------------------------------------------------------------------------
+
+
+class PairTransition(nn.Module):
+    """LayerNorm + SwiGLU FFN returning a DELTA (caller adds the residual)."""
+
+    def __init__(self, d_model, expansion_ratio=4):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model, eps=_EPS)
+        self.ffn = SwiGLUMLP(d_model, expansion_ratio=expansion_ratio)
+
+    def __call__(self, x):
+        return self.ffn(self.norm(x))
+
+
+class OuterProductMean(nn.Module):
+    def __init__(self, d_msa, d_hidden, d_pair):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_msa, eps=_EPS)
+        self.W = nn.Linear(d_msa, 2 * d_hidden, bias=False)
+        self.Wout = nn.Linear(d_hidden * d_hidden, d_pair, bias=True)
+
+    def __call__(self, m, msa_attention_mask):
+        m_norm = self.norm(m)
+        x = self.W(m_norm) * msa_attention_mask[..., None].astype(m_norm.dtype)
+        a, b = mx.split(x, 2, axis=-1)  # (B,L,M,c),(B,L,M,d)
+        mask_f = msa_attention_mask.astype(a.dtype)
+        n_valid = mx.maximum((mask_f @ mask_f.transpose(0, 2, 1))[..., None], 1.0)
+        outer = mx.einsum("bimc,bjmd->bijcd", a, b)  # (B,L,L,c,d)
+        B, L = outer.shape[0], outer.shape[1]
+        return self.Wout(outer.reshape(B, L, L, -1)) / n_valid
+
+
+class MSAPairWeightedAveraging(nn.Module):
+    def __init__(self, d_msa, d_pair, n_heads=8, head_width=32):
+        super().__init__()
+        self.n_heads, self.head_width = n_heads, head_width
+        self.norm_single = nn.LayerNorm(d_msa, eps=_EPS)
+        self.compute_bias = [nn.LayerNorm(d_pair, eps=_EPS), nn.Linear(d_pair, n_heads, bias=False)]
+        self.Wv = nn.Linear(d_msa, n_heads * head_width, bias=False)
+        self.Wgate = nn.Linear(d_msa, n_heads * head_width, bias=False)
+        self.Wout = nn.Linear(n_heads * head_width, d_msa, bias=False)
+
+    def __call__(self, msa_repr, pair_repr, pair_attention_mask):
+        B, L, M, _ = msa_repr.shape
+        h, dh = self.n_heads, self.head_width
+        msa_normed = self.norm_single(msa_repr)
+        bias = pair_repr
+        for layer in self.compute_bias:
+            bias = layer(bias)  # (B,L,L,h)
+        bias = mx.where(pair_attention_mask[..., None].astype(mx.bool_), bias, -1e5)
+        attn = mx.softmax(bias, axis=-2)  # softmax over j (dim=-2 of (B,i,j,h))
+        v = self.Wv(msa_normed).reshape(B, L, M, h, dh)
+        gate = mx.sigmoid(self.Wgate(msa_normed)).reshape(B, L, M, h, dh)
+        # einsum("bijh,bjmhd,bimhd->bimhd") split: contract j, then elementwise gate
+        ctx = mx.einsum("bijh,bjmhd->bimhd", attn, v)
+        out = ctx * gate
+        return self.Wout(out.reshape(B, L, M, h * dh))
+
+
+class MSAEncoderBlock(nn.Module):
+    def __init__(self, d_msa, d_pair, d_hidden, n_heads_msa, msa_head_width, is_final_block=False):
+        super().__init__()
+        self.is_final_block = is_final_block
+        self.outer_product_mean = OuterProductMean(d_msa, d_hidden, d_pair)
+        if not is_final_block:
+            self.msa_pair_weighted_averaging = MSAPairWeightedAveraging(d_msa, d_pair, n_heads_msa, msa_head_width)
+            self.msa_transition = PairTransition(d_msa, expansion_ratio=4)
+        self.tri_mul_out = TriangleMultiplicativeUpdate(dim=d_pair, outgoing=True)
+        self.tri_mul_in = TriangleMultiplicativeUpdate(dim=d_pair, outgoing=False)
+        self.pair_transition = PairTransition(d_pair, expansion_ratio=4)
+
+    def __call__(self, m, pair, msa_attention_mask, pair_attention_mask):
+        pair = pair + self.outer_product_mean(m, msa_attention_mask)
+        if not self.is_final_block:
+            m = m + self.msa_pair_weighted_averaging(m, pair, pair_attention_mask)
+            m = m + self.msa_transition(m)
+        pair = pair + self.tri_mul_out(pair, mask=pair_attention_mask)
+        pair = pair + self.tri_mul_in(pair, mask=pair_attention_mask)
+        pair = pair + self.pair_transition(pair)
+        return m, pair
+
+
+class MSAEncoder(nn.Module):
+    def __init__(self, d_msa, d_pair, d_inputs, d_hidden=32, n_layers=4, n_heads_msa=8, msa_head_width=16):
+        super().__init__()
+        self.embed = nn.Linear(35, d_msa, bias=False)
+        self.project_inputs = nn.Linear(d_inputs, d_msa, bias=False)
+        self.blocks = [
+            MSAEncoderBlock(d_msa, d_pair, d_hidden, n_heads_msa, msa_head_width,
+                            is_final_block=(i == n_layers - 1))
+            for i in range(n_layers)
+        ]
+
+    def __call__(self, x_pair, x_inputs, msa_oh, has_deletion, deletion_value, msa_attention_mask):
+        m_feat = mx.concatenate([msa_oh, has_deletion[..., None], deletion_value[..., None]], axis=-1)
+        m = self.embed(m_feat) + self.project_inputs(x_inputs)[:, :, None]
+        tok_mask = msa_attention_mask[:, :, 0].astype(mx.bool_)
+        pair_am = (tok_mask[:, :, None] & tok_mask[:, None, :]).astype(mx.float32)
+        for block in self.blocks:
+            m, x_pair = block(m, x_pair, msa_attention_mask, pair_am)
+        return x_pair
+
+
+# ---------------------------------------------------------------------------
 # Top-level ESMFold2Model (pure MLX). Consumes a features dict (mx arrays),
 # returns a dict of mx arrays. torch<->mlx bridging lives in a separate adapter.
 # ---------------------------------------------------------------------------
@@ -1321,6 +1432,16 @@ class ESMFold2Model(nn.Module):
             inference_num_steps=sh.get("inference_num_steps", 68))
         self.distogram_head = nn.Linear(d_pair, sh.get("distogram_bins", 64))
 
+        mc = config.get("msa_encoder", {}) or {}
+        self.msa_encoder_overwrite = bool(config.get("msa_encoder_overwrite", True))
+        if mc.get("enabled", False):
+            self.msa_encoder = MSAEncoder(
+                d_msa=mc["d_msa"], d_pair=d_pair, d_inputs=d_inputs,
+                d_hidden=mc["d_hidden"], n_layers=mc["n_layers"],
+                n_heads_msa=mc["n_heads_msa"], msa_head_width=mc["msa_head_width"])
+        else:
+            self.msa_encoder = None
+
     def _dynamics(self):
         delta = _softplus(self.parcae_log_delta)
         a = mx.exp(-delta * mx.exp(self.parcae_log_a)).reshape(1, 1, 1, -1)
@@ -1370,8 +1491,17 @@ class ESMFold2Model(nn.Module):
         z = mx.zeros_like(z_init) if z0 is None else z0
         a, b = self._dynamics()
         for _ in range(max(1, num_loops + 1)):
-            refined = self.lm_encoder(lm_z, mask=pair_mask)
-            z_inject = z_init + refined
+            z_inject = z_init
+            if self.msa_encoder is not None and "msa" in feats:
+                msa_oh = _one_hot(feats["msa"].transpose(0, 2, 1), NUM_RES_TYPES)  # (B,L,M,33)
+                msa_attn = feats["msa_attention_mask"].transpose(0, 2, 1).astype(mx.float32)
+                msa_oh = msa_oh * msa_attn[..., None]
+                hd = feats["has_deletion"].transpose(0, 2, 1).astype(mx.float32)
+                dv = feats["deletion_value"].transpose(0, 2, 1).astype(mx.float32)
+                msa_pair = self.msa_encoder(z_inject, x_inputs, msa_oh, hd, dv, msa_attn)
+                z_inject = msa_pair if self.msa_encoder_overwrite else z_inject + msa_pair
+            if self.lm_encoder is not None:
+                z_inject = z_inject + self.lm_encoder(lm_z, mask=pair_mask)
             injected = self.parcae_input_norm(z_inject)
             z = a * z + injected @ b.T
             z = self.folding_trunk(z, mask=pair_mask)
@@ -1403,7 +1533,8 @@ class ESMFold2Model(nn.Module):
 
 
 def sanitize_esmfold2(weights: dict) -> dict:
-    """Strip `._engine.` and drop confidence_head.* (not built in the coords path)."""
+    """Strip `._engine.`; drop confidence_head.* and msa_encoder.* (unused in the
+    single-sequence coords path; msa_encoder only fires when an MSA is provided)."""
     out = {}
     for k, v in weights.items():
         if k.startswith("confidence_head."):
