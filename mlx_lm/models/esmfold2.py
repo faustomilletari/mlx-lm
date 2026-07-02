@@ -94,8 +94,17 @@ PROFILER = _Profiler()
 #                   attention instead of a manual softmax (bf16-level).
 #   C COMPILE     — mx.compile the trunk block-stack (bit-exact), cached per shape.
 CACHE_COND = True
-FUSED_ATTN = True
+FUSED_ATTN = False  # B gives no speedup once A caches the pair bias, and it breaks
+#                     bit-parity (fused softmax reassociates) — off by default.
 COMPILE = True
+# D/E/F trunk + sampler optimizations (see TriangleMultiplicativeUpdate / weighted_rigid_align):
+#   E BF16_CONTRACT — do the triangle-mul contraction in bf16 (fp32 accumulation)
+#                     instead of upcasting to fp32; halves that matmul's bandwidth.
+#   D TRIMUL_KERNEL — fused custom Metal kernel for the triangle-mul contraction.
+#   F GPU_KABSCH    — closed-form 3x3 rigid align on-GPU (no per-step CPU SVD sync).
+BF16_CONTRACT = False
+TRIMUL_KERNEL = False
+GPU_KABSCH = False
 
 
 # ---------------------------------------------------------------------------
