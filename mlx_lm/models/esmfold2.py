@@ -15,96 +15,12 @@ reference. Implemented so far: the FoldingTrunk backbone
 reused by the trunk, lm_encoder, parcae_coda, and confidence head.
 """
 
-import time as _time
 from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten
 
 _EPS = 1e-5
-
-
-class _Profiler:
-    """Opt-in profiler for the ESMFold2 fold.
-
-    Two independent capabilities, both **off by default (zero overhead)**:
-
-    * timing — ``PROFILER.run(name, thunk)`` wraps a section; when ``time_on`` it
-      synchronizes + evaluates the section's outputs so wall-time is attributed
-      correctly (this serializes the GPU, so use the numbers for the *relative*
-      breakdown, not absolute throughput).
-    * capture — ``PROFILER.capture(name, array)`` snapshots an activation (as
-      float32 numpy) when ``cap_on``; first-write-wins within a run so a section
-      called once per diffusion step records step 0. Used to gate optimizations:
-      dump activations before a change, dump after, and diff.
-    """
-
-    def __init__(self):
-        self.time_on = False
-        self.cap_on = False
-        self.acc = {}
-        self.cnt = {}
-        self.caps = {}
-
-    def reset(self):
-        self.acc, self.cnt, self.caps = {}, {}, {}
-
-    @staticmethod
-    def _eval_tree(out):
-        arrs = [v for _, v in tree_flatten(out) if isinstance(v, mx.array)]
-        if arrs:
-            mx.eval(arrs)
-
-    def run(self, name, thunk):
-        if not self.time_on:
-            return thunk()
-        mx.synchronize()
-        t0 = _time.perf_counter()
-        out = thunk()
-        self._eval_tree(out)
-        mx.synchronize()
-        dt = _time.perf_counter() - t0
-        self.acc[name] = self.acc.get(name, 0.0) + dt
-        self.cnt[name] = self.cnt.get(name, 0) + 1
-        return out
-
-    def capture(self, name, arr):
-        if self.cap_on and name not in self.caps and isinstance(arr, mx.array):
-            import numpy as np
-
-            mx.eval(arr)
-            self.caps[name] = np.asarray(arr.astype(mx.float32))
-        return arr
-
-    def report(self):
-        rows = []
-        for name in sorted(self.acc, key=lambda k: -self.acc[k]):
-            n = self.cnt[name]
-            rows.append((name, self.acc[name], n, self.acc[name] / max(n, 1)))
-        return rows
-
-
-PROFILER = _Profiler()
-
-# Inference optimizations (toggleable for benchmarking / bit-parity checks):
-#   A CACHE_COND  — precompute the t-independent diffusion conditioning + per-block
-#                   pair bias once and reuse across all sampling steps (bit-exact).
-#   B FUSED_ATTN  — fused mx.fast.scaled_dot_product_attention for the token
-#                   attention instead of a manual softmax (bf16-level).
-#   C COMPILE     — mx.compile the trunk block-stack (bit-exact), cached per shape.
-CACHE_COND = True
-FUSED_ATTN = False  # B gives no speedup once A caches the pair bias, and it breaks
-#                     bit-parity (fused softmax reassociates) — off by default.
-COMPILE = True
-# D/E/F trunk + sampler optimizations (see TriangleMultiplicativeUpdate / weighted_rigid_align):
-#   E BF16_CONTRACT — do the triangle-mul contraction in bf16 (fp32 accumulation)
-#                     instead of upcasting to fp32; halves that matmul's bandwidth.
-#   D TRIMUL_KERNEL — fused custom Metal kernel for the triangle-mul contraction.
-#   F GPU_KABSCH    — closed-form 3x3 rigid align on-GPU (no per-step CPU SVD sync).
-BF16_CONTRACT = False
-TRIMUL_KERNEL = False
-GPU_KABSCH = False
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +101,7 @@ class TriangleMultiplicativeUpdate(nn.Module):
         routed = signal * mx.sigmoid(gate_logits)
         if mask is not None:
             routed = routed * mask[..., None]
-        # Reference performs the contraction in fp32.
+        # Contraction in fp32 (matches the reference).
         left, right = mx.split(routed.astype(mx.float32), 2, axis=-1)
         contracted = self._contract(left, right).astype(z.dtype)
         mixed = self.proj_emit(self.norm_mix(contracted))
@@ -231,9 +147,9 @@ class FoldingTrunk(nn.Module):
         return pair
 
     def __call__(self, pair: mx.array, mask: Optional[mx.array] = None) -> mx.array:
-        # Optimization C: fuse the whole block stack via mx.compile (cached per
-        # shape). Only when a concrete mask is present (compile needs array args).
-        if COMPILE and mask is not None:
+        # Fuse the whole block stack with mx.compile (cached per shape); only when
+        # a concrete mask is present (compile needs array arguments).
+        if mask is not None:
             if self._compiled is None:
                 self._compiled = mx.compile(self._apply_blocks)
             return self._compiled(pair, mask)
@@ -870,14 +786,12 @@ class AttentionPairBias(nn.Module):
         kt = k.transpose(0, 2, 1, 3)
         vt = v.transpose(0, 2, 1, 3)
 
-        # Additive attention bias: pair bias + padding. ``pair_bias`` may be
-        # precomputed (optimization A) to skip the per-step O(L²) bias projection.
+        # Additive attention bias: pair bias + padding. When folding, ``pair_bias``
+        # is precomputed once (the pair rep is fixed across diffusion steps) and
+        # passed in, skipping the per-step O(L²) bias projection.
         bias = self.pair_bias(z, attention_mask) if pair_bias is None else pair_bias
-        if FUSED_ATTN:  # optimization B: fused SDPA kernel
-            ctx = mx.fast.scaled_dot_product_attention(qt, kt, vt, scale=self.scale, mask=bias)
-        else:  # manual softmax (reference path)
-            logits = (qt @ kt.transpose(0, 1, 3, 2)) * self.scale + bias
-            ctx = mx.softmax(logits, axis=-1) @ vt
+        logits = (qt @ kt.transpose(0, 1, 3, 2)) * self.scale + bias
+        ctx = mx.softmax(logits, axis=-1) @ vt
         ctx = ctx.transpose(0, 2, 1, 3)  # (B, Nq, H, hd)
         ctx = g * ctx
         out = self.out_proj(ctx.reshape(B, Nq, self.d_model))
@@ -1037,33 +951,31 @@ class DiffusionModule(nn.Module):
         if t.shape[0] == 1:
             t = mx.broadcast_to(t, (bsz,))
 
-        if cond is not None:  # optimization A: reuse precomputed t-independent parts
+        # ``cond`` holds the precomputed t-independent conditioning (pair rep,
+        # base single rep, per-block pair biases), reused across all steps.
+        if cond is not None:
             z, s_base, pair_biases = cond
-            s = PROFILER.run("denoise.conditioning",
-                             lambda: self.conditioning.dynamic_part(t, s_base, sigma))
+            s = self.conditioning.dynamic_part(t, s_base, sigma)
         else:
             pair_biases = None
-            s, z = PROFILER.run(
-                "denoise.conditioning",
-                lambda: self.conditioning(t, s_inputs, z_trunk, relative_position_encoding, sigma))
+            s, z = self.conditioning(t, s_inputs, z_trunk, relative_position_encoding, sigma)
         denom = mx.sqrt(t * t + sigma * sigma)
         r_noisy = x_noisy / denom[:, None, None]
 
-        a, q_skip, c_skip, p_skip = PROFILER.run("denoise.atom_enc", lambda: self.atom_encoder(
+        a, q_skip, c_skip, p_skip = self.atom_encoder(
             ref_pos, ref_mask, ref_space_uid, ref_charge, ref_element,
             ref_atom_name_chars, tok_idx, n_tokens, r_l=r_noisy,
-            num_diffusion_samples=num_diffusion_samples, return_skip=True))
+            num_diffusion_samples=num_diffusion_samples, return_skip=True)
         a = a + self.s_to_token(self.s_step_norm(s))
-        a = PROFILER.run("denoise.token_tx", lambda: self.token_transformer(
-            a, s, z, attention_mask=token_attention_mask, pair_biases=pair_biases))
+        a = self.token_transformer(
+            a, s, z, attention_mask=token_attention_mask, pair_biases=pair_biases)
         a = self.token_norm(a)
-        r_update = PROFILER.run("denoise.atom_dec", lambda: self.atom_decoder(
-            a, q_skip, c_skip, p_skip, tok_idx, num_diffusion_samples=num_diffusion_samples))
+        r_update = self.atom_decoder(
+            a, q_skip, c_skip, p_skip, tok_idx, num_diffusion_samples=num_diffusion_samples)
 
         sigma2, t2 = sigma * sigma, t * t
         out = (sigma2 / (sigma2 + t2))[:, None, None] * x_noisy
         out = out + ((sigma * t) / mx.sqrt(sigma2 + t2))[:, None, None] * r_update
-        PROFILER.capture("denoise_out", out)
         return out
 
 
@@ -1095,7 +1007,6 @@ def weighted_rigid_align(x, x_gt, w, mask):
     U, _, Vh = mx.linalg.svd(H32, stream=mx.cpu)
     det = _det3(U @ Vh)
     ones = mx.ones_like(det)
-    D = mx.zeros((*det.shape, 3, 3))
     diag = mx.stack([ones, ones, det], axis=-1)
     D = mx.eye(3) * diag[..., None, :]  # diag_embed([1,1,det])
     R = (U @ D @ Vh).astype(H.dtype)
@@ -1180,12 +1091,10 @@ class DiffusionSampler(nn.Module):
         def draw(shape):
             return mx.array(next(_it)) if _it is not None else mx.random.normal(shape)
 
-        # Optimization A: the t-independent conditioning (pair rep + base single
-        # rep) is identical across all steps — compute it once, reuse every step.
-        cond = PROFILER.run("sample.cond_precompute", lambda:
-            self.diffusion_module.precompute_conditioning(
-                s_inputs, z_trunk, relative_position_encoding, token_attention_mask)) \
-            if CACHE_COND else None
+        # The t-independent conditioning (pair rep, base single rep, per-block pair
+        # biases) is identical across all steps — compute it once, reuse each step.
+        cond = self.diffusion_module.precompute_conditioning(
+            s_inputs, z_trunk, relative_position_encoding, token_attention_mask)
 
         x = sl[0] * draw((tb, n_atoms, 3))
         gl = [self.gamma_0 if s > self.gamma_min else 0.0 for s in sl]
@@ -1205,8 +1114,8 @@ class DiffusionSampler(nn.Module):
                 relative_position_encoding=relative_position_encoding, n_tokens=n_tokens,
                 token_attention_mask=token_attention_mask,
                 num_diffusion_samples=num_diffusion_samples, cond=cond)
-            x_noisy = PROFILER.run("sample.kabsch", lambda: weighted_rigid_align(
-                x_noisy.astype(mx.float32), x_den.astype(mx.float32), atom_mask, atom_mask))
+            x_noisy = weighted_rigid_align(
+                x_noisy.astype(mx.float32), x_den.astype(mx.float32), atom_mask, atom_mask)
             x = x_noisy + eta * (sigma_t - t_hat) * ((x_noisy - x_den) / t_hat)
             x_prev = x_den
         return x
@@ -1646,8 +1555,7 @@ class ESMFold2Model(nn.Module):
 
     def trunk(self, feats, lm_hidden_states=None, z0=None, num_loops=3):
         if lm_hidden_states is None:
-            lm_hidden_states = PROFILER.run(
-                "esmc", lambda: self.compute_lm_hidden_states(feats["input_ids"]))
+            lm_hidden_states = self.compute_lm_hidden_states(feats["input_ids"])
         """Preprocess -> inputs_embedder -> z_init -> loop -> readout/coda. Returns (z, x_inputs)."""
         tok_mask = feats["token_attention_mask"].astype(mx.float32)
         atm_mask = feats["atom_attention_mask"].astype(mx.float32)
@@ -1677,7 +1585,8 @@ class ESMFold2Model(nn.Module):
         pair_mask = tok_mask[:, :, None] * tok_mask[:, None, :]
         z = mx.zeros_like(z_init) if z0 is None else z0
         a, b = self._dynamics()
-        for _ in range(max(1, num_loops + 1)):
+        def _conditioning():
+            # Loop-invariant injection term: msa/lm encoders -> input-norm -> @ b.
             z_inject = z_init
             if self.msa_encoder is not None and "msa" in feats:
                 msa_oh = _one_hot(feats["msa"].transpose(0, 2, 1), NUM_RES_TYPES)  # (B,L,M,33)
@@ -1689,8 +1598,12 @@ class ESMFold2Model(nn.Module):
                 z_inject = msa_pair if self.msa_encoder_overwrite else z_inject + msa_pair
             if self.lm_encoder is not None:
                 z_inject = z_inject + self.lm_encoder(lm_z, mask=pair_mask)
-            injected = self.parcae_input_norm(z_inject)
-            z = a * z + injected @ b.T
+            return self.parcae_input_norm(z_inject) @ b.T
+
+        # The conditioning is identical every loop — compute it once (hoisted).
+        inj = _conditioning()
+        for _ in range(max(1, num_loops + 1)):
+            z = a * z + inj
             z = self.folding_trunk(z, mask=pair_mask)
         z = self.parcae_readout(z)
         z = self.parcae_coda(z, mask=pair_mask)
@@ -1729,21 +1642,15 @@ class ESMFold2Model(nn.Module):
 
     def fold(self, feats, lm_hidden_states=None, num_loops=3, num_sampling_steps=50,
              num_diffusion_samples=1, z0=None, return_confidence=False):
-        z, x_inputs, aux = PROFILER.run(
-            "trunk", lambda: self.trunk(feats, lm_hidden_states, z0=z0, num_loops=num_loops))
-        PROFILER.capture("x_inputs", x_inputs)
-        PROFILER.capture("z_trunk", z)
-        coords = PROFILER.run("sample", lambda: self.structure_head.sample(
+        z, x_inputs, aux = self.trunk(feats, lm_hidden_states, z0=z0, num_loops=num_loops)
+        coords = self.structure_head.sample(
             z_trunk=z, s_inputs=x_inputs, relative_position_encoding=aux["relpos"],
             ref_pos=aux["ref_pos"], ref_charge=aux["ref_charge"], ref_mask=aux["ref_mask"],
             ref_element=aux["ref_element_oh"], ref_atom_name_chars=aux["ref_name_oh"],
             ref_space_uid=aux["ref_space_uid"], tok_idx=aux["atom_to_token"],
             n_tokens=aux["n_tokens"], token_attention_mask=aux["tok_mask"],
-            num_diffusion_samples=num_diffusion_samples, num_sampling_steps=num_sampling_steps))
-        PROFILER.capture("coords", coords)
-        disto = PROFILER.run("distogram", lambda: self.distogram(z))
-        PROFILER.capture("distogram", disto)
-        out = {"sample_atom_coords": coords, "distogram_logits": disto}
+            num_diffusion_samples=num_diffusion_samples, num_sampling_steps=num_sampling_steps)
+        out = {"sample_atom_coords": coords, "distogram_logits": self.distogram(z)}
         if return_confidence:
             out.update(self.confidence(feats, z, x_inputs, aux, coords,
                                        num_diffusion_samples=num_diffusion_samples))
