@@ -1,4 +1,3 @@
-# Copyright © 2024 Apple Inc.
 """MLX implementation of ESMFold2 (pure-reference path).
 
 ESMFold2 is a protein structure predictor: a pair-tensor refiner conditioned on
@@ -8,11 +7,6 @@ implementation — no Triton/fused kernels, no flash-attention, no transformer-
 engine/fp8, no tensor/sequence parallelism (all of which have pure-PyTorch
 fallbacks selected by `set_kernel_backend(None)`, the default when those optional
 libraries are absent).
-
-This file is being built incrementally, parity-gated against the PyTorch
-reference. Implemented so far: the FoldingTrunk backbone
-(TriangleMultiplicativeUpdate, Transition/SwiGLU, PairUpdateBlock, FoldingTrunk),
-reused by the trunk, lm_encoder, parcae_coda, and confidence head.
 """
 
 from typing import Optional
@@ -275,9 +269,7 @@ class RelativePositionEncoding(nn.Module):
 # F.rms_norm with eps=None uses finfo(float32).eps for fp32 inputs.
 _RMS_EPS_F32 = 1.1920929e-07
 
-# The reference forces bf16 inside the SWA atom attention. Exposed as a global
-# so we can test whether that precision is what over-disperses the full model's
-# stochastic (noise_scale>0) diffusion churn.
+# The reference forces bf16 inside the SWA atom attention.
 _SWA_DTYPE = mx.bfloat16
 
 
@@ -1554,9 +1546,9 @@ class ESMFold2Model(nn.Module):
         return hs.transpose(1, 2, 0, 3)                               # (B, L, n+1, D)
 
     def trunk(self, feats, lm_hidden_states=None, z0=None, num_loops=3):
+        """Preprocess -> inputs_embedder -> z_init -> loop -> readout/coda. Returns (z, x_inputs, aux)."""
         if lm_hidden_states is None:
             lm_hidden_states = self.compute_lm_hidden_states(feats["input_ids"])
-        """Preprocess -> inputs_embedder -> z_init -> loop -> readout/coda. Returns (z, x_inputs)."""
         tok_mask = feats["token_attention_mask"].astype(mx.float32)
         atm_mask = feats["atom_attention_mask"].astype(mx.float32)
         B, L = feats["res_type"].shape
