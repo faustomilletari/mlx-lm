@@ -697,7 +697,7 @@ class DiffusionConditioning(nn.Module):
     def static_part(self, s_inputs, z_trunk, relative_position_encoding):
         """t-independent conditioning: the pair rep ``z`` and the base single rep
         ``s_base``. These are identical across all diffusion steps, so the sampler
-        computes them once and reuses them (optimization A)."""
+        computes them once and reuses them."""
         z = mx.concatenate([z_trunk, relative_position_encoding], axis=-1)
         z = self.z_proj(self.z_input_norm(z))
         for block in self.z_transitions:
@@ -753,7 +753,7 @@ class AttentionPairBias(nn.Module):
     def pair_bias(self, z, attention_mask=None):
         """Additive attention bias from the pair rep (+ padding), as an SDPA mask
         (B,H,Nq,Nk). Depends only on z + mask, so the sampler precomputes it once
-        (optimization A) and passes it back in via ``__call__(pair_bias=...)``."""
+        and passes it back in via ``__call__(pair_bias=...)``."""
         if z.ndim == 4:
             bias = self.pair_bias_proj(self.pair_norm(z)).transpose(0, 3, 1, 2)  # (B,H,Nq,Nk)
         else:
@@ -834,8 +834,8 @@ class DiffusionTransformer(nn.Module):
         ]
 
     def precompute_pair_bias(self, z, attention_mask=None):
-        """Per-block additive attention bias (optimization A): fixed across
-        diffusion steps because it depends only on the (fixed) pair rep z."""
+        """Per-block additive attention bias: fixed across diffusion steps
+        because it depends only on the (fixed) pair rep z."""
         return [attn.pair_bias(z, attention_mask) for attn in self.attn_blocks]
 
     def __call__(self, a, s, z, attention_mask=None, pair_biases=None):
@@ -926,9 +926,9 @@ class DiffusionModule(nn.Module):
 
     def precompute_conditioning(self, s_inputs, z_trunk, relative_position_encoding,
                                 token_attention_mask=None):
-        """Optimization A: compute everything t-independent ONCE — the pair rep z,
-        the base single rep s_base, and the per-block token-attention pair biases
-        — so the sampler reuses them across all diffusion steps."""
+        """Compute everything t-independent ONCE — the pair rep z, the base single
+        rep s_base, and the per-block token-attention pair biases — so the sampler
+        reuses them across all diffusion steps."""
         z, s_base = self.conditioning.static_part(s_inputs, z_trunk, relative_position_encoding)
         pair_biases = self.token_transformer.precompute_pair_bias(z, token_attention_mask)
         return z, s_base, pair_biases
