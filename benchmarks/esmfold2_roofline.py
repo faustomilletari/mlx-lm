@@ -109,8 +109,16 @@ def main():
         if args.fold_seconds and i < len(args.fold_seconds):
             meas = args.fold_seconds[i]
             print(f"  measured fold                    : {meas:8.1f} s")
-            print(f"  => {meas/floor:5.2f}x the GEMM floor. "
-                  f"{'Headroom is OUTSIDE the GEMMs.' if meas/floor > 1.5 else 'GEMMs are the floor; a kernel will not help.'}")
+            r = meas / floor
+            if r < 0.9:
+                verdict = ("floor exceeds the measured fold -- settings differ "
+                           "between this run and the fold; compare like for like")
+            elif r < 1.5:
+                verdict = "the GEMMs ARE the fold. A custom kernel will not help."
+            else:
+                verdict = (f"{r:.1f}x the GEMM floor -- most of the time is NOT in "
+                           "the GEMMs. Worth locating before writing a kernel.")
+            print(f"  => {verdict}")
         print()
 
 
