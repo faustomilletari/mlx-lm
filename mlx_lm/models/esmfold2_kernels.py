@@ -392,3 +392,27 @@ def trimul_gated_dual(
         output_shapes=[(M, N)],
         output_dtypes=[x.dtype],
     )[0]
+
+
+def trimul_gated_dual_kernel_only(x, w_sig, w_gate, mask=None):
+    """Call the dual-GEMM kernel directly, bypassing USE_DUAL_KERNEL.
+
+    For benchmarking: the gate exists because the kernel hurts inside the
+    compiled trunk, but timing it in isolation is still worth doing.
+    """
+    M, K = x.shape
+    N = w_sig.shape[0]
+    kernel = _trimul_dual_kernel_masked if mask is not None else _trimul_dual_kernel
+    if kernel is None:
+        return trimul_gated_dual_ops(x, w_sig, w_gate, mask)
+    inputs = [x, w_sig, w_gate, M, N, K]
+    if mask is not None:
+        inputs.insert(3, mask)
+    return kernel(
+        inputs=inputs,
+        template=[("T", x.dtype)],
+        grid=((N // TN) * 32, (M + TM - 1) // TM * SIMDGROUPS, 1),
+        threadgroup=(32, SIMDGROUPS, 1),
+        output_shapes=[(M, N)],
+        output_dtypes=[x.dtype],
+    )[0]

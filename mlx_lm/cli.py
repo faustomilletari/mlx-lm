@@ -10,6 +10,7 @@ def main():
         "cache_prompt",
         "chat",
         "convert",
+        "esmfold2_bench",
         "evaluate",
         "fuse",
         "generate",
