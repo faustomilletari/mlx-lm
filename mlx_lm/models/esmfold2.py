@@ -149,6 +149,8 @@ class FoldingTrunk(nn.Module):
         ]
         # Fuses the whole stack, cached per shape. Traced on first call, so
         # building it here still sees the loaded weights.
+        # (shapeless=True is not usable here: mx.split cannot be traced without
+        # a concrete shape.)
         self._compiled = mx.compile(self._apply_blocks)
 
     def _apply_blocks(self, pair, mask):
@@ -297,6 +299,7 @@ def _rotate_half(x: mx.array) -> mx.array:
     return mx.concatenate([-x2, x1], axis=-1)
 
 
+@mx.compile
 def apply_rotary_emb_3d(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
     # x: (B, L, H, D); cos/sin: (B, L, D/2). Tile cos/sin to D by repetition.
     ro_dim = cos.shape[-1] * 2
