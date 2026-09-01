@@ -824,8 +824,11 @@ class AttentionPairBias(nn.Module):
         # is precomputed once (the pair rep is fixed across diffusion steps) and
         # passed in, skipping the per-step O(L²) bias projection.
         bias = self.pair_bias(z, attention_mask) if pair_bias is None else pair_bias
-        logits = (qt @ kt.transpose(0, 1, 3, 2)) * self.scale + bias
-        ctx = mx.softmax(logits, axis=-1) @ vt
+        # bias is already SDPA's additive-mask layout. Not bit-exact: SDPA
+        # always softmaxes in fp32.
+        ctx = mx.fast.scaled_dot_product_attention(
+            qt, kt, vt, scale=self.scale, mask=bias.astype(qt.dtype)
+        )
         ctx = ctx.transpose(0, 2, 1, 3)  # (B, Nq, H, hd)
         ctx = g * ctx
         out = self.out_proj(ctx.reshape(B, Nq, self.d_model))
