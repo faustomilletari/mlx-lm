@@ -16,7 +16,11 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from .esmfold2_kernels import trimul_epilogue, trimul_gated_dual
+from .esmfold2_kernels import (
+    USE_EPILOGUE_KERNEL,
+    trimul_epilogue,
+    trimul_gated_dual,
+)
 
 _EPS = 1e-5
 
@@ -162,8 +166,15 @@ class PairUpdateBlock(nn.Module):
         self.pair_transition = Transition(d_pair, expansion_ratio=expansion_ratio)
 
     def __call__(self, pair: mx.array, mask: Optional[mx.array] = None) -> mx.array:
-        pair = self.tri_mul_out(pair, mask=mask, residual=pair)
-        pair = self.tri_mul_in(pair, mask=mask, residual=pair)
+        # `pair + delta` lets MLX donate delta's buffer and free the old pair in
+        # place. Routing the residual through the kernel gives that up; only do
+        # it when the kernel is explicitly enabled.
+        if USE_EPILOGUE_KERNEL:
+            pair = self.tri_mul_out(pair, mask=mask, residual=pair)
+            pair = self.tri_mul_in(pair, mask=mask, residual=pair)
+        else:
+            pair = pair + self.tri_mul_out(pair, mask=mask)
+            pair = pair + self.tri_mul_in(pair, mask=mask)
         return pair + self.pair_transition(pair)
 
 

@@ -33,9 +33,18 @@ Shapes, with M = B*L*L and K = N = c_z:
     residual, out   : [M, N]
 """
 
+import os
 from typing import Optional
 
 import mlx.core as mx
+
+#: The output-stage kernel costs more memory than it saves time. A custom
+#: Metal kernel cannot donate its output buffer, so the residual add stops
+#: being done in place: `pair` must stay live as a kernel input while a new
+#: [M, c_z] output is allocated, 48 times per trunk loop. MLX caches freed
+#: buffers, so across folds of different sizes that cache never gets reused.
+#: Off until the kernel donates or the win justifies it.
+USE_EPILOGUE_KERNEL = os.environ.get("MLX_ESMFOLD2_EPILOGUE_KERNEL", "0") == "1"
 
 # Output tile per threadgroup, and the K step. TN and TK must divide N and K;
 # c_z is 256 in every published checkpoint, so 32 divides both. SIMDGROUPS * 8
@@ -155,7 +164,6 @@ def _make_trimul_epilogue_kernel():
 _trimul_epilogue_kernel = _make_trimul_epilogue_kernel()
 
 
-@mx.compile
 def trimul_epilogue_ops(
     x_value: mx.array,
     x_gate: mx.array,
@@ -204,6 +212,7 @@ def trimul_epilogue(
     N, K = w_emit.shape
     usable = (
         use_kernel
+        and USE_EPILOGUE_KERNEL
         and _trimul_epilogue_kernel is not None
         and mx.default_device() == mx.gpu
         and x_value.dtype == x_gate.dtype == w_emit.dtype == w_gate.dtype
@@ -323,7 +332,6 @@ _trimul_dual_kernel = _make_trimul_dual_kernel(False)
 _trimul_dual_kernel_masked = _make_trimul_dual_kernel(True)
 
 
-@mx.compile
 def trimul_gated_dual_ops(
     x: mx.array,
     w_sig: mx.array,
