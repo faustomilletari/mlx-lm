@@ -264,6 +264,136 @@ def cmd_kernels(args):
         print()
 
 
+
+
+# ---------------------------------------------------------------------------
+# trunk
+# ---------------------------------------------------------------------------
+
+
+def cmd_trunk(args):
+    """Is the trunk's overhead a constant factor, or does it grow with size?
+
+    Runs the trunk with random weights and NO language model, so peak memory is
+    only the trunk's own. At small L that is a few hundred MB and swapping is
+    impossible; if the overhead ratio there matches the ratio at L=1000, the
+    slowdown is not memory pressure.
+
+    Then breaks one TriMul into stages so the overhead has an address.
+    """
+    from mlx.utils import tree_map
+
+    from mlx_lm.models.esmfold2 import (
+        PairUpdateBlock,
+        TriangleMultiplicativeUpdate,
+        Transition,
+    )
+
+    D, dt = args.c_z, mx.bfloat16
+    NB = args.blocks
+    print(f"device={mx.default_device()}  c_z={D}  blocks={NB}  no LM loaded\n")
+
+    def bf16(m):
+        m.update(tree_map(lambda a: a.astype(dt), m.parameters()))
+        mx.eval(m.parameters())
+        return m
+
+    print("A. does the overhead ratio grow with L?")
+    hdr = (f"  {'L':>6}{'pair MB':>9}{'trunk s':>10}{'GEMM floor s':>14}"
+           f"{'ratio':>8}{'peak MB':>10}")
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for L in args.lengths:
+        M = L * L
+        blocks = [bf16(PairUpdateBlock(d_pair=D, expansion_ratio=4))
+                  for _ in range(NB)]
+        z = mx.random.normal((1, L, L, D)).astype(dt)
+        msk = mx.ones((1, L, L)).astype(mx.float32)
+        mx.eval(z, msk)
+
+        def run():
+            p = z
+            for b in blocks:
+                p = b(p, mask=msk)
+            return p
+
+        mx.clear_cache()
+        mx.reset_peak_memory()
+        t_trunk = timeit(run, iters=max(2, args.iters // 4), warmup=1)
+        peak = mx.get_peak_memory() / 2**20
+
+        # GEMM floor for the same work, measured at this L.
+        a = mx.random.normal((1, D, L, L)).astype(dt)
+        b_ = mx.random.normal((1, D, L, L)).astype(dt)
+        x = mx.random.normal((M, D)).astype(dt)
+        w4 = mx.random.normal((4 * D, D)).astype(dt)
+        w12 = mx.random.normal((2 * 4 * D, D)).astype(dt)
+        w3 = mx.random.normal((D, 4 * D)).astype(dt)
+        mx.eval(a, b_, x, w4, w12, w3)
+        t_c = timeit(lambda: a @ b_.transpose(0, 1, 3, 2), args.iters)
+        t_b = timeit(lambda: x @ w4.T, args.iters)
+        t_w = timeit(lambda: x @ w12.T, args.iters)
+        h = mx.random.normal((M, 4 * D)).astype(dt)
+        mx.eval(h)
+        t_3 = timeit(lambda: h @ w3.T, args.iters)
+        # per block: 2 trimul (contraction + bundle + 2 small proj) + 1 transition
+        floor = NB * (2 * (t_c + t_b) + t_w + t_3)
+
+        print(f"  {L:>6}{M*D*2/2**20:>9.0f}{t_trunk:>10.2f}{floor:>14.2f}"
+              f"{t_trunk/floor:>8.2f}{peak:>10.0f}")
+        del blocks, z, msk, a, b_, x, w4, w12, w3, h
+        mx.clear_cache()
+
+    # B. stage breakdown at the largest L
+    L = args.lengths[-1]
+    print(f"\nB. one TriMul at L={L}, stage by stage")
+    tri = bf16(TriangleMultiplicativeUpdate(dim=D, outgoing=True))
+    trans = bf16(Transition(D, expansion_ratio=4))
+    z = mx.random.normal((1, L, L, D)).astype(dt)
+    msk = mx.ones((1, L, L)).astype(mx.float32)
+    mx.eval(z, msk)
+
+    normalized = tri.norm_start(z)
+    mx.eval(normalized)
+    bundled = tri.proj_bundle(normalized)
+    mx.eval(bundled)
+    sig, gl = mx.split(bundled, 2, axis=-1)
+    routed = (sig * mx.sigmoid(gl)) * msk[..., None]
+    mx.eval(routed)
+    lf, rt = mx.split(routed.astype(dt), 2, axis=-1)
+    mx.eval(lf, rt)
+    contracted = tri._contract(lf, rt).astype(dt)
+    mx.eval(contracted)
+
+    stages = [
+        ("norm_start  LN [B,L,L,256]", lambda: tri.norm_start(z)),
+        ("proj_bundle GEMM ->[M,1024]", lambda: tri.proj_bundle(normalized)),
+        ("gate+mask   elementwise", lambda: (lambda s, g: (s * mx.sigmoid(g))
+                                             * msk[..., None])(
+            *mx.split(bundled, 2, axis=-1))),
+        ("cast bf16 + split", lambda: mx.split(routed.astype(dt), 2, axis=-1)),
+        ("_contract   transposes+GEMM", lambda: tri._contract(lf, rt).astype(dt)),
+        ("norm_mix    LN", lambda: tri.norm_mix(contracted)),
+        ("proj_emit + proj_gate + sig*", lambda: tri.proj_emit(
+            tri.norm_mix(contracted)) * mx.sigmoid(tri.proj_gate(normalized))),
+        ("residual add", lambda: z + contracted),
+        ("pair_transition (whole)", lambda: trans(z)),
+    ]
+    print(f"  {'stage':<34}{'ms':>9}{'GB/s eff':>10}")
+    tot = 0.0
+    for label, fn in stages:
+        t = timeit(fn, max(2, args.iters // 2))
+        tot += t
+        bytes_moved = 2 * M * D * 2  # ~one read + one write of the pair tensor
+        print(f"  {label:<34}{t*1e3:>9.1f}{bytes_moved/t/1e9:>10.0f}")
+    print(f"  {'-'*34}{'':>9}")
+    print(f"  {'sum of stages (1 trimul + 1 trans)':<34}{tot*1e3:>9.1f}")
+    print("\n  GB/s counts one read + one write of the pair tensor, so it is only")
+    print("  meaningful on the elementwise rows; GEMM rows move more than that.")
+    print(f"\n  x2 trimul + transition, x{NB} blocks -> "
+          f"{(2*(tot - timeit(lambda: trans(z), 2)) + timeit(lambda: trans(z), 2))*NB:.1f} s/loop")
+
+
 def main():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--c-z", type=int, default=256)
@@ -286,6 +416,11 @@ def main():
     pr.add_argument("--seq-len", type=int, default=460)
     pr.add_argument("--steps", type=int, nargs="+", default=[50, 14])
     pr.set_defaults(func=cmd_profile)
+
+    tk = sub.add_parser("trunk", parents=[common],
+                        help="is trunk overhead constant or size-dependent?")
+    tk.add_argument("--lengths", type=int, nargs="+", default=[200, 400, 600, 1000])
+    tk.set_defaults(func=cmd_trunk)
 
     k = sub.add_parser("kernels", parents=[common], help="fused Metal kernels vs pure MLX")
     k.add_argument("--lengths", type=int, nargs="+", default=[100, 300, 500, 1000])
