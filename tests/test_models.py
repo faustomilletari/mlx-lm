@@ -3391,6 +3391,50 @@ class TestModels(unittest.TestCase):
         chunked = model.trunk(feats, z0=z0, num_loops=1)[0]
         self.assertTrue(mx.allclose(full, chunked, atol=1e-4))
 
+    def test_esmfold2_trimul_epilogue(self):
+        from mlx_lm.models.esmfold2 import TriangleMultiplicativeUpdate
+        from mlx_lm.models.esmfold2_kernels import (
+            trimul_epilogue,
+            trimul_epilogue_ops,
+        )
+
+        M, K, N = 512, 256, 256
+        xv = mx.random.normal((M, K)).astype(mx.bfloat16)
+        xg = mx.random.normal((M, K)).astype(mx.bfloat16)
+        we = mx.random.normal((N, K)).astype(mx.bfloat16)
+        wg = mx.random.normal((N, K)).astype(mx.bfloat16)
+        res = mx.random.normal((M, N)).astype(mx.bfloat16)
+
+        # Whichever path trimul_epilogue picks must match the open-coded form.
+        want = res + (xv @ we.T) * mx.sigmoid(xg @ wg.T)
+        for got in (
+            trimul_epilogue(xv, xg, we, wg, res),
+            trimul_epilogue(xv, xg, we, wg, res, use_kernel=False),
+            trimul_epilogue_ops(xv, xg, we, wg, res),
+        ):
+            self.assertEqual(got.shape, (M, N))
+            self.assertEqual(got.dtype, mx.bfloat16)
+            self.assertTrue(
+                mx.allclose(got, want, atol=2e-2, rtol=2e-2).item(), "epilogue mismatch"
+            )
+
+        # Passing `residual` into TriMul must equal adding it afterwards.
+        tri = TriangleMultiplicativeUpdate(dim=N, outgoing=True)
+        tri.update(tree_map(lambda a: a.astype(mx.bfloat16), tri.parameters()))
+        mx.eval(tri.parameters())
+        for L in (12, 31):
+            z = mx.random.normal((1, L, L, N)).astype(mx.bfloat16)
+            mask = mx.ones((1, L, L)).astype(mx.float32)
+            self.assertTrue(
+                mx.allclose(
+                    z + tri(z, mask=mask),
+                    tri(z, mask=mask, residual=z),
+                    atol=2e-2,
+                    rtol=2e-2,
+                ).item(),
+                f"residual fusion mismatch at L={L}",
+            )
+
     def test_esmfold2_config_field_names(self):
         from mlx_lm.models import esmfold2
 

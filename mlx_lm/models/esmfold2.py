@@ -16,6 +16,8 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from .esmfold2_kernels import trimul_epilogue
+
 _EPS = 1e-5
 
 
@@ -99,7 +101,18 @@ class TriangleMultiplicativeUpdate(nn.Module):
         out = l @ r.transpose(0, 1, 3, 2)  # (B, D, i, j)
         return out.transpose(0, 2, 3, 1)  # (B, i, j, D)
 
-    def __call__(self, z: mx.array, mask: Optional[mx.array] = None) -> mx.array:
+    def __call__(
+        self,
+        z: mx.array,
+        mask: Optional[mx.array] = None,
+        residual: Optional[mx.array] = None,
+    ) -> mx.array:
+        """Returns the update, or ``residual + update`` when ``residual`` is given.
+
+        Passing the residual lets the output stage go through the fused Metal
+        kernel, which keeps the two GEMM results in register instead of writing
+        them to memory. Same arithmetic either way.
+        """
         normalized = self.norm_start(z)
         bundled = self.proj_bundle(normalized)
         signal, gate_logits = mx.split(bundled, 2, axis=-1)
@@ -110,9 +123,20 @@ class TriangleMultiplicativeUpdate(nn.Module):
         # reference path upcasts to fp32; the fused one does not.)
         left, right = mx.split(routed.astype(mx.bfloat16), 2, axis=-1)
         contracted = self._contract(left, right).astype(z.dtype)
-        mixed = self.proj_emit(self.norm_mix(contracted))
-        out_gate = mx.sigmoid(self.proj_gate(normalized))
-        return mixed * out_gate
+
+        x_value = self.norm_mix(contracted)
+        if residual is None:
+            return self.proj_emit(x_value) * mx.sigmoid(self.proj_gate(normalized))
+
+        shape = residual.shape
+        D = shape[-1]
+        return trimul_epilogue(
+            x_value.reshape(-1, D),
+            normalized.reshape(-1, D),
+            self.proj_emit.weight,
+            self.proj_gate.weight,
+            residual.reshape(-1, D),
+        ).reshape(shape)
 
 
 # ---------------------------------------------------------------------------
@@ -133,8 +157,8 @@ class PairUpdateBlock(nn.Module):
         self.pair_transition = Transition(d_pair, expansion_ratio=expansion_ratio)
 
     def __call__(self, pair: mx.array, mask: Optional[mx.array] = None) -> mx.array:
-        pair = pair + self.tri_mul_out(pair, mask=mask)
-        pair = pair + self.tri_mul_in(pair, mask=mask)
+        pair = self.tri_mul_out(pair, mask=mask, residual=pair)
+        pair = self.tri_mul_in(pair, mask=mask, residual=pair)
         return pair + self.pair_transition(pair)
 
 
