@@ -49,37 +49,46 @@ _SOURCE = f"""
     const uint m0 = threadgroup_position_in_grid.y * kTM;
     const uint sg = simdgroup_index_in_threadgroup;   // 0..kSG-1
     const uint lane = thread_index_in_simdgroup;      // 0..31
-    const uint tid = sg * 32 + lane;                  // 0..kSG*32-1
+    const uint tid = sg * 32 + lane;
     const uint nthreads = kSG * 32;
 
-    threadgroup T Av[kTM * kTK];
-    threadgroup T Ag[kTM * kTK];
-    threadgroup T Bv[kTK * kTN];   // stored transposed: [k][n]
-    threadgroup T Bg[kTK * kTN];
+    // One staging buffer, carved up. Tiles are float, not T: MLX's own steel
+    // GEMM runs A, B and C as float and converts on load (see steel/gemm/mma.h),
+    // and simdgroup_load requires the matrix and pointer element types to match.
+    threadgroup float tg[4 * kTM * kTK];
+    threadgroup float *Av = tg;
+    threadgroup float *Ag = tg + kTM * kTK;
+    threadgroup float *Bv = tg + 2 * kTM * kTK;   // stored transposed: [k][n]
+    threadgroup float *Bg = tg + 3 * kTM * kTK;
 
-    // Each simdgroup owns rows [sg*8, sg*8+8) of the tile, all kTN columns.
+    // Zero the accumulators from a zeroed patch. simdgroup_matrix<float>(v)
+    // fills the DIAGONAL, not the matrix, so it cannot be used here.
+    for (uint i = tid; i < 64; i += nthreads) {{
+        tg[i] = 0.0f;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     simdgroup_matrix<float, 8, 8> acc_v[kTN / 8];
     simdgroup_matrix<float, 8, 8> acc_g[kTN / 8];
     for (int j = 0; j < kTN / 8; ++j) {{
-        acc_v[j] = simdgroup_matrix<float, 8, 8>(0.0f);
-        acc_g[j] = simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_load(acc_v[j], tg, 8);
+        simdgroup_load(acc_g[j], tg, 8);
     }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint k0 = 0; k0 < (uint)K; k0 += kTK) {{
-        // Cooperative load of the A tiles: kTM*kTK elements over nthreads.
         for (uint i = tid; i < kTM * kTK; i += nthreads) {{
             uint r = i / kTK, c = i % kTK;
             uint gm = m0 + r;
             bool ok = (gm < (uint)M);
-            Av[i] = ok ? x_value[gm * (uint)K + k0 + c] : (T)0;
-            Ag[i] = ok ? x_gate[gm * (uint)K + k0 + c] : (T)0;
+            Av[i] = ok ? static_cast<float>(x_value[gm * (uint)K + k0 + c]) : 0.0f;
+            Ag[i] = ok ? static_cast<float>(x_gate[gm * (uint)K + k0 + c]) : 0.0f;
         }}
-        // B tiles, transposed on the way in so the MMA sees [k][n].
         for (uint i = tid; i < kTN * kTK; i += nthreads) {{
             uint r = i / kTK, c = i % kTK;         // r over n, c over k
             uint gn = n0 + r;
-            Bv[c * kTN + r] = w_emit[gn * (uint)K + k0 + c];
-            Bg[c * kTN + r] = w_gate[gn * (uint)K + k0 + c];
+            Bv[c * kTN + r] = static_cast<float>(w_emit[gn * (uint)K + k0 + c]);
+            Bg[c * kTN + r] = static_cast<float>(w_gate[gn * (uint)K + k0 + c]);
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -97,9 +106,10 @@ _SOURCE = f"""
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }}
 
-    // Epilogue: gate and residual in register, one write.
-    threadgroup float Ov[kTM * kTN];
-    threadgroup float Og[kTM * kTN];
+    // Epilogue: gate and residual applied in one pass. Reuses the staging
+    // buffer -- the A/B tiles are dead after the last barrier above.
+    threadgroup float *Ov = tg;
+    threadgroup float *Og = tg + kTM * kTN;
     for (int j = 0; j < kTN / 8; ++j) {{
         simdgroup_store(acc_v[j], Ov + sg * 8 * kTN + j * 8, kTN);
         simdgroup_store(acc_g[j], Og + sg * 8 * kTN + j * 8, kTN);
@@ -110,10 +120,9 @@ _SOURCE = f"""
         uint r = i / kTN, c = i % kTN;
         uint gm = m0 + r, gn = n0 + c;
         if (gm < (uint)M) {{
-            float v = Ov[i];
             float g = 1.0f / (1.0f + metal::exp(-Og[i]));
             uint o = gm * (uint)N + gn;
-            out[o] = (T)((float)residual[o] + v * g);
+            out[o] = static_cast<T>(static_cast<float>(residual[o]) + Ov[i] * g);
         }}
     }}
 """
