@@ -38,13 +38,22 @@ from typing import Optional
 
 import mlx.core as mx
 
-#: The output-stage kernel costs more memory than it saves time. A custom
-#: Metal kernel cannot donate its output buffer, so the residual add stops
-#: being done in place: `pair` must stay live as a kernel input while a new
-#: [M, c_z] output is allocated, 48 times per trunk loop. MLX caches freed
-#: buffers, so across folds of different sizes that cache never gets reused.
-#: Off until the kernel donates or the win justifies it.
+#: Both kernels are OFF by default. Measured on an M-series machine they cost
+#: memory and returned little speed, for two reasons that apply to any custom
+#: kernel placed inside the trunk:
+#:
+#: 1. A custom kernel cannot donate its output buffer. ``pair + delta`` writes
+#:    the sum into delta's buffer and frees the old pair in place; a kernel
+#:    always allocates. MLX caches freed buffers, so a differently sized
+#:    molecule next cannot reuse any of it.
+#: 2. FoldingTrunk._apply_blocks is mx.compile'd and a metal_kernel is opaque
+#:    to that trace, which costs the cross-block fusion the trunk relied on.
+#:
+#: Turn one on to measure it:
+#:   MLX_ESMFOLD2_EPILOGUE_KERNEL=1   TriMul output stage
+#:   MLX_ESMFOLD2_DUAL_KERNEL=1       TriMul input stage
 USE_EPILOGUE_KERNEL = os.environ.get("MLX_ESMFOLD2_EPILOGUE_KERNEL", "0") == "1"
+USE_DUAL_KERNEL = os.environ.get("MLX_ESMFOLD2_DUAL_KERNEL", "0") == "1"
 
 # Output tile per threadgroup, and the K step. TN and TK must divide N and K;
 # c_z is 256 in every published checkpoint, so 32 divides both. SIMDGROUPS * 8
@@ -361,6 +370,7 @@ def trimul_gated_dual(
     kernel = _trimul_dual_kernel_masked if mask is not None else _trimul_dual_kernel
     usable = (
         use_kernel
+        and USE_DUAL_KERNEL
         and kernel is not None
         and mx.default_device() == mx.gpu
         and x.dtype == w_sig.dtype == w_gate.dtype

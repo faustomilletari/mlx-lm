@@ -17,6 +17,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .esmfold2_kernels import (
+    USE_DUAL_KERNEL,
     USE_EPILOGUE_KERNEL,
     trimul_epilogue,
     trimul_gated_dual,
@@ -121,13 +122,19 @@ class TriangleMultiplicativeUpdate(nn.Module):
         # Gated dual GEMM: proj_bundle's [M, 4*dim] output never reaches memory.
         # weight is [4*dim, dim]; first half feeds the signal, second the gate.
         half = 2 * self.dim
-        flat = normalized.reshape(-1, normalized.shape[-1])
-        routed = trimul_gated_dual(
-            flat,
-            self.proj_bundle.weight[:half],
-            self.proj_bundle.weight[half:],
-            None if mask is None else mask.reshape(-1).astype(flat.dtype),
-        ).reshape(*z.shape[:-1], half)
+        if USE_DUAL_KERNEL:
+            flat = normalized.reshape(-1, normalized.shape[-1])
+            routed = trimul_gated_dual(
+                flat,
+                self.proj_bundle.weight[:half],
+                self.proj_bundle.weight[half:],
+                None if mask is None else mask.reshape(-1).astype(flat.dtype),
+            ).reshape(*z.shape[:-1], half)
+        else:
+            signal, gate_logits = mx.split(self.proj_bundle(normalized), 2, axis=-1)
+            routed = signal * mx.sigmoid(gate_logits)
+            if mask is not None:
+                routed = routed * mask[..., None]
         # bf16 contraction, as esm's fused Triton path does. (esm's unfused
         # reference path upcasts to fp32; the fused one does not.)
         left, right = mx.split(routed.astype(mx.bfloat16), 2, axis=-1)
