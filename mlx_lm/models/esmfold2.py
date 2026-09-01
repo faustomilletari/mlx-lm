@@ -134,7 +134,12 @@ class TriangleMultiplicativeUpdate(nn.Module):
             signal, gate_logits = mx.split(self.proj_bundle(normalized), 2, axis=-1)
             routed = signal * mx.sigmoid(gate_logits)
             if mask is not None:
-                routed = routed * mask[..., None]
+                # Cast the mask to routed's dtype first. pair_mask is fp32, so
+                # multiplying by it promoted the whole [M, 2*dim] tensor to fp32
+                # -- doubling the write, then paying a full read+write again on
+                # the cast below. The mask is exactly 0.0 or 1.0, so doing it in
+                # bf16 is bit-identical.
+                routed = routed * mask[..., None].astype(routed.dtype)
         # bf16 contraction, as esm's fused Triton path does. (esm's unfused
         # reference path upcasts to fp32; the fused one does not.)
         left, right = mx.split(routed.astype(mx.bfloat16), 2, axis=-1)
