@@ -173,6 +173,31 @@ def cmd_profile(args):
         f"trunk ({args.loops} loops x 24 blocks)",
         lambda: model.trunk(feats, lm, num_loops=args.loops),
     )
+
+    # Fixed vs per-loop: time the trunk at several loop counts. The slope is
+    # the pair-block cost, the intercept is everything the trunk does once --
+    # inputs embedder, LanguageModelShim/SingleToPair, relpos, z_init,
+    # _init_pair_state. Part A of the `trunk` benchmark only covers the slope.
+    if args.loop_sweep:
+        print("\nloop sweep (fixed vs per-loop trunk cost)")
+        pts = []
+        for n in args.loop_sweep:
+            mx.synchronize()
+            t = time.perf_counter()
+            mx.eval(model.trunk(feats, lm, num_loops=n))
+            mx.synchronize()
+            dt = time.perf_counter() - t
+            pts.append((n, dt))
+            print(f"  num_loops={n:<3} {dt:8.2f}s")
+        if len(pts) >= 2:
+            (n0, t0), (n1, t1) = pts[0], pts[-1]
+            slope = (t1 - t0) / (n1 - n0)
+            fixed = t0 - slope * n0
+            print(f"\n  per loop (24 pair blocks) : {slope:8.2f}s")
+            print(f"  fixed, once per fold      : {fixed:8.2f}s"
+                  f"   <- inputs embedder + LM shim + z_init + relpos")
+            print(f"  at num_loops={args.loops}: {100*fixed/(fixed+slope*args.loops):.0f}%"
+                  f" of trunk time is the fixed part")
     for steps in args.steps:
         mx.random.seed(0)
         phase(f"sampler ({steps} steps)", lambda s=steps:
@@ -415,6 +440,7 @@ def main():
     pr.add_argument("--sequence", default=None)
     pr.add_argument("--seq-len", type=int, default=460)
     pr.add_argument("--steps", type=int, nargs="+", default=[50, 14])
+    pr.add_argument("--loop-sweep", type=int, nargs="*", default=[1, 2, 3])
     pr.set_defaults(func=cmd_profile)
 
     tk = sub.add_parser("trunk", parents=[common],
