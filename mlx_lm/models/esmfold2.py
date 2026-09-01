@@ -106,8 +106,9 @@ class TriangleMultiplicativeUpdate(nn.Module):
         routed = signal * mx.sigmoid(gate_logits)
         if mask is not None:
             routed = routed * mask[..., None]
-        # Contraction in fp32 (matches the reference).
-        left, right = mx.split(routed.astype(mx.float32), 2, axis=-1)
+        # bf16 contraction, as esm's fused Triton path does. (esm's unfused
+        # reference path upcasts to fp32; the fused one does not.)
+        left, right = mx.split(routed.astype(mx.bfloat16), 2, axis=-1)
         contracted = self._contract(left, right).astype(z.dtype)
         mixed = self.proj_emit(self.norm_mix(contracted))
         out_gate = mx.sigmoid(self.proj_gate(normalized))
