@@ -2,7 +2,19 @@
 
 """Fused Metal kernels for ESMFold2's pair stack.
 
-The one kernel here is the TriMul output stage:
+Two kernels, both folding a sigmoid gate into a GEMM epilogue so the wide
+intermediate never reaches memory.
+
+:func:`trimul_gated_dual` -- the TriMul *input* stage:
+
+    routed = (x @ w_sig.T) * sigmoid(x @ w_gate.T) * mask
+
+Unfused, ``proj_bundle`` writes an [M, 4*c_z] tensor -- four times the width of
+the pair tensor -- and the gate reads it straight back. Fused, one input tile
+feeds both GEMMs and only the [M, 2*c_z] result is written. Mirrors esm's
+``fused_gated_dual_gemm``.
+
+:func:`trimul_epilogue` -- the TriMul *output* stage:
 
     out = residual + (x_value @ w_emit.T) * sigmoid(x_gate @ w_gate.T)
 
@@ -203,3 +215,162 @@ def trimul_epilogue(
     if not usable:
         return trimul_epilogue_ops(x_value, x_gate, w_emit, w_gate, residual)
     return trimul_epilogue_kernel(x_value, x_gate, w_emit, w_gate, residual)
+
+
+# ---------------------------------------------------------------------------
+# TriMul input stage: gated dual GEMM
+# ---------------------------------------------------------------------------
+
+# Both GEMMs share one input tile, so A is staged once.
+_DUAL_SOURCE_TMPL = """
+    constexpr int kTM = {TM};
+    constexpr int kTN = {TN};
+    constexpr int kTK = {TK};
+    constexpr int kSG = {SG};
+
+    const uint n0 = threadgroup_position_in_grid.x * kTN;
+    const uint m0 = threadgroup_position_in_grid.y * kTM;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const uint tid = sg * 32 + lane;
+    const uint nthreads = kSG * 32;
+
+    threadgroup float tg[3 * kTM * kTK];
+    threadgroup float *A  = tg;
+    threadgroup float *Bs = tg + kTM * kTK;       // signal weights, [k][n]
+    threadgroup float *Bg = tg + 2 * kTM * kTK;   // gate weights,   [k][n]
+
+    for (uint i = tid; i < 64; i += nthreads) {{
+        tg[i] = 0.0f;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_matrix<float, 8, 8> acc_s[kTN / 8];
+    simdgroup_matrix<float, 8, 8> acc_g[kTN / 8];
+    for (int j = 0; j < kTN / 8; ++j) {{
+        simdgroup_load(acc_s[j], tg, 8);
+        simdgroup_load(acc_g[j], tg, 8);
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint k0 = 0; k0 < (uint)K; k0 += kTK) {{
+        for (uint i = tid; i < kTM * kTK; i += nthreads) {{
+            uint r = i / kTK, c = i % kTK;
+            uint gm = m0 + r;
+            A[i] = (gm < (uint)M) ? static_cast<float>(x[gm * (uint)K + k0 + c]) : 0.0f;
+        }}
+        for (uint i = tid; i < kTN * kTK; i += nthreads) {{
+            uint r = i / kTK, c = i % kTK;
+            uint gn = n0 + r;
+            Bs[c * kTN + r] = static_cast<float>(w_sig[gn * (uint)K + k0 + c]);
+            Bg[c * kTN + r] = static_cast<float>(w_gate[gn * (uint)K + k0 + c]);
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int kk = 0; kk < kTK; kk += 8) {{
+            simdgroup_matrix<float, 8, 8> a, b_s, b_g;
+            simdgroup_load(a, A + sg * 8 * kTK + kk, kTK);
+            for (int j = 0; j < kTN / 8; ++j) {{
+                simdgroup_load(b_s, Bs + kk * kTN + j * 8, kTN);
+                simdgroup_load(b_g, Bg + kk * kTN + j * 8, kTN);
+                simdgroup_multiply_accumulate(acc_s[j], a, b_s, acc_s[j]);
+                simdgroup_multiply_accumulate(acc_g[j], a, b_g, acc_g[j]);
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+
+    threadgroup float *Os = tg;
+    threadgroup float *Og = tg + kTM * kTN;
+    for (int j = 0; j < kTN / 8; ++j) {{
+        simdgroup_store(acc_s[j], Os + sg * 8 * kTN + j * 8, kTN);
+        simdgroup_store(acc_g[j], Og + sg * 8 * kTN + j * 8, kTN);
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < kTM * kTN; i += nthreads) {{
+        uint r = i / kTN, c = i % kTN;
+        uint gm = m0 + r, gn = n0 + c;
+        if (gm < (uint)M) {{
+            float g = 1.0f / (1.0f + metal::exp(-Og[i]));
+            float v = Os[i] * g;
+            {MASK}
+            out[gm * (uint)N + gn] = static_cast<T>(v);
+        }}
+    }}
+"""
+
+
+def _make_trimul_dual_kernel(has_mask: bool):
+    if not mx.metal.is_available():
+        return None
+    names = ["x", "w_sig", "w_gate", "M", "N", "K"]
+    if has_mask:
+        names.insert(3, "mask")
+    return mx.fast.metal_kernel(
+        name=f"trimul_gated_dual{'_mask' if has_mask else ''}",
+        input_names=names,
+        output_names=["out"],
+        header=_HEADER,
+        source=_DUAL_SOURCE_TMPL.format(
+            TM=TM, TN=TN, TK=TK, SG=SIMDGROUPS,
+            MASK="v *= static_cast<float>(mask[gm]);" if has_mask else "",
+        ),
+    )
+
+
+_trimul_dual_kernel = _make_trimul_dual_kernel(False)
+_trimul_dual_kernel_masked = _make_trimul_dual_kernel(True)
+
+
+@mx.compile
+def trimul_gated_dual_ops(
+    x: mx.array,
+    w_sig: mx.array,
+    w_gate: mx.array,
+    mask: Optional[mx.array] = None,
+) -> mx.array:
+    """Pure-MLX reference for the gated dual GEMM."""
+    out = (x @ w_sig.T) * mx.sigmoid(x @ w_gate.T)
+    if mask is not None:
+        out = out * mask[:, None]
+    return out
+
+
+def trimul_gated_dual(
+    x: mx.array,
+    w_sig: mx.array,
+    w_gate: mx.array,
+    mask: Optional[mx.array] = None,
+    use_kernel: bool = True,
+) -> mx.array:
+    """``(x @ w_sig.T) * sigmoid(x @ w_gate.T)``, optional row-shared mask.
+
+    ``x`` is [M, K]; ``w_sig`` and ``w_gate`` are [N, K]; ``mask`` is [M].
+    """
+    M, K = x.shape
+    N = w_sig.shape[0]
+    kernel = _trimul_dual_kernel_masked if mask is not None else _trimul_dual_kernel
+    usable = (
+        use_kernel
+        and kernel is not None
+        and mx.default_device() == mx.gpu
+        and x.dtype == w_sig.dtype == w_gate.dtype
+        and x.ndim == 2
+        and N % TN == 0
+        and K % TK == 0
+        and (mask is None or (mask.ndim == 1 and mask.dtype == x.dtype))
+    )
+    if not usable:
+        return trimul_gated_dual_ops(x, w_sig, w_gate, mask)
+    inputs = [x, w_sig, w_gate, M, N, K]
+    if mask is not None:
+        inputs.insert(3, mask)
+    return kernel(
+        inputs=inputs,
+        template=[("T", x.dtype)],
+        grid=((N // TN) * 32, (M + TM - 1) // TM * SIMDGROUPS, 1),
+        threadgroup=(32, SIMDGROUPS, 1),
+        output_shapes=[(M, N)],
+        output_dtypes=[x.dtype],
+    )[0]

@@ -16,7 +16,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from .esmfold2_kernels import trimul_epilogue
+from .esmfold2_kernels import trimul_epilogue, trimul_gated_dual
 
 _EPS = 1e-5
 
@@ -114,11 +114,16 @@ class TriangleMultiplicativeUpdate(nn.Module):
         them to memory. Same arithmetic either way.
         """
         normalized = self.norm_start(z)
-        bundled = self.proj_bundle(normalized)
-        signal, gate_logits = mx.split(bundled, 2, axis=-1)
-        routed = signal * mx.sigmoid(gate_logits)
-        if mask is not None:
-            routed = routed * mask[..., None]
+        # Gated dual GEMM: proj_bundle's [M, 4*dim] output never reaches memory.
+        # weight is [4*dim, dim]; first half feeds the signal, second the gate.
+        half = 2 * self.dim
+        flat = normalized.reshape(-1, normalized.shape[-1])
+        routed = trimul_gated_dual(
+            flat,
+            self.proj_bundle.weight[:half],
+            self.proj_bundle.weight[half:],
+            None if mask is None else mask.reshape(-1).astype(flat.dtype),
+        ).reshape(*z.shape[:-1], half)
         # bf16 contraction, as esm's fused Triton path does. (esm's unfused
         # reference path upcasts to fp32; the fused one does not.)
         left, right = mx.split(routed.astype(mx.bfloat16), 2, axis=-1)

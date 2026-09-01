@@ -14,7 +14,12 @@ import time
 
 import mlx.core as mx
 
-from mlx_lm.models.esmfold2_kernels import trimul_epilogue_kernel, trimul_epilogue_ops
+from mlx_lm.models.esmfold2_kernels import (
+    trimul_epilogue_kernel,
+    trimul_epilogue_ops,
+    trimul_gated_dual,
+    trimul_gated_dual_ops,
+)
 
 # ESMFold2-Fast: 2 trimuls per block * 24 blocks * num_loops.
 CALLS_PER_FOLD = 2 * 24 * 3
@@ -41,8 +46,34 @@ def main():
         print("Metal not available -- both paths are identical here. Nothing to time.")
         return
 
-    K = N = args.c_z
+    K = args.c_z
+    N = K
     print(f"device={mx.default_device()} c_z={K}\n")
+    print("== TriMul input stage: gated dual GEMM (proj_bundle) ==")
+    hdr = (f"{'L':>6}{'M':>12}{'ops ms':>10}{'kernel ms':>12}{'speedup':>10}"
+           f"{'max|d|':>11}{'per fold':>11}")
+    print(hdr)
+    print("-" * len(hdr))
+    for L in args.lengths:
+        M = L * L
+        x = mx.random.normal((M, K)).astype(mx.bfloat16)
+        ws = mx.random.normal((2 * K, K)).astype(mx.bfloat16)
+        wg = mx.random.normal((2 * K, K)).astype(mx.bfloat16)
+        msk = mx.ones((M,)).astype(mx.bfloat16)
+        mx.eval(x, ws, wg, msk)
+        a = trimul_gated_dual_ops(x, ws, wg, msk)
+        c = trimul_gated_dual(x, ws, wg, msk)
+        mx.eval(a, c)
+        d = float(mx.max(mx.abs(a.astype(mx.float32) - c.astype(mx.float32))))
+        t_ops = timeit(trimul_gated_dual_ops, x, ws, wg, msk, iters=args.iters)
+        t_ker = timeit(trimul_gated_dual, x, ws, wg, msk, iters=args.iters)
+        saved = (t_ops - t_ker) * CALLS_PER_FOLD
+        print(f"{L:>6}{M:>12}{t_ops*1e3:>10.2f}{t_ker*1e3:>12.2f}"
+              f"{t_ops/t_ker:>9.2f}x{d:>11.3g}{saved:>10.2f}s")
+    print("\nmax|d| is expected small-but-nonzero here: the kernel gates in fp32")
+    print("and rounds once, the ops path gates in bf16.\n")
+
+    print("== TriMul output stage: gated GEMM + residual ==")
     hdr = f"{'L':>6}{'M':>12}{'ops ms':>10}{'kernel ms':>12}{'speedup':>10}{'max|d|':>11}{'per fold':>11}"
     print(hdr)
     print("-" * len(hdr))

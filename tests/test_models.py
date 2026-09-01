@@ -3435,6 +3435,34 @@ class TestModels(unittest.TestCase):
                 f"residual fusion mismatch at L={L}",
             )
 
+    def test_esmfold2_trimul_gated_dual(self):
+        from mlx_lm.models.esmfold2_kernels import (
+            trimul_gated_dual,
+            trimul_gated_dual_ops,
+        )
+
+        M, K, N = 512, 256, 512
+        x = mx.random.normal((M, K)).astype(mx.bfloat16)
+        ws = mx.random.normal((N, K)).astype(mx.bfloat16)
+        wg = mx.random.normal((N, K)).astype(mx.bfloat16)
+        mask = (mx.random.uniform(shape=(M,)) > 0.3).astype(mx.bfloat16)
+
+        for m in (None, mask):
+            want = (x @ ws.T) * mx.sigmoid(x @ wg.T)
+            if m is not None:
+                want = want * m[:, None]
+            for got in (
+                trimul_gated_dual(x, ws, wg, m),
+                trimul_gated_dual(x, ws, wg, m, use_kernel=False),
+                trimul_gated_dual_ops(x, ws, wg, m),
+            ):
+                self.assertEqual(got.shape, (M, N))
+                self.assertEqual(got.dtype, mx.bfloat16)
+                self.assertTrue(
+                    mx.allclose(got, want, atol=2e-2, rtol=2e-2).item(),
+                    "gated dual GEMM mismatch",
+                )
+
     def test_esmfold2_config_field_names(self):
         from mlx_lm.models import esmfold2
 
