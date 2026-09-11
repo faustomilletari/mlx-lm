@@ -20,8 +20,8 @@ is an upper bound. Confirm the top offenders with a .gputrace.
 from __future__ import annotations
 
 import json
+import math
 import time
-from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Optional
@@ -447,3 +447,132 @@ def render_modes(eval_wall: float, lazy_wall: float) -> str:
 def save_json(path: str, payload: dict) -> None:
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# sweep across sequence lengths
+# ---------------------------------------------------------------------------
+
+
+def fit_exponent(xs: list[float], ys: list[float]) -> Optional[float]:
+    """Least-squares slope of log(y) against log(x), i.e. k in y ~ x**k.
+
+    Returns None when there are fewer than two usable points. Timing noise at
+    short lengths inflates k, so read it as a shape, not a measurement: ~1 is
+    linear in length, ~2 pairwise, ~3 a triangular contraction.
+    """
+    pts = [(math.log(x), math.log(y)) for x, y in zip(xs, ys) if x > 0 and y > 0]
+    if len(pts) < 2:
+        return None
+    n = len(pts)
+    mx_ = sum(p[0] for p in pts) / n
+    my = sum(p[1] for p in pts) / n
+    num = sum((p[0] - mx_) * (p[1] - my) for p in pts)
+    den = sum((p[0] - mx_) ** 2 for p in pts)
+    return num / den if den > 0 else None
+
+
+def render_sweep(rows: list[dict], phases: list[str]) -> str:
+    """Per-length phase totals. `rows` come from the sweep driver."""
+    head = f"{'L':>6}" + "".join(f"{p[:11]+' s':>13}" for p in phases)
+    head += f"{'total s':>10}{'lazy %':>8}{'peak GB':>9}"
+    out = ["== phase time vs sequence length", head, "-" * len(head)]
+    for r in rows:
+        line = f"{r['L']:>6}"
+        for p in phases:
+            line += f"{r['phase_s'].get(p, float('nan')):>13.3f}"
+        line += (f"{r['total_s']:>10.3f}{100*r['lazy_share']:>8.1f}"
+                 f"{r['peak_gb']:>9.2f}")
+        out.append(line)
+    if len(rows) >= 2:
+        k = fit_exponent([r["L"] for r in rows], [r["total_s"] for r in rows])
+        out.append("")
+        out.append(f"  total scales as L^{k:.2f}" if k is not None
+                   else "  not enough points to fit a scaling exponent")
+        for p in phases:
+            kp = fit_exponent([r["L"] for r in rows],
+                              [r["phase_s"].get(p, 0.0) for r in rows])
+            if kp is not None:
+                out.append(f"    {p:<12} L^{kp:.2f}")
+    return "\n".join(out)
+
+
+def render_scaling(per_class: dict, lengths: list[int],
+                   ceilings: Optional[Ceilings] = None, top: int = 20,
+                   title: str = "per-class scaling",
+                   label: str = "class") -> str:
+    """Rank module classes by cost at the longest length, with an exponent.
+
+    Share alone misleads. A class at 10% with k=3 overtakes one at 30% with
+    k=1, so both columns have to be read together.
+    """
+    Lmax = max(lengths)
+    rank = sorted(per_class.items(),
+                  key=lambda kv: kv[1].get(Lmax, {}).get("excl_s", 0.0),
+                  reverse=True)
+    total = sum(v.get(Lmax, {}).get("excl_s", 0.0) for _, v in rank) or 1.0
+    peak = ceilings.peak_bw_gbs if ceilings else None
+
+    w = 34
+    head = (f"{label:<{w}}{'calls':>7}{f'L={Lmax} s':>12}{'%':>6}"
+            f"{'L^k':>7}{'GB/s':>9}")
+    if peak:
+        head += f"{'%BW':>6}{'verdict':>13}"
+    out = [f"== {title}  (ranked at L={Lmax})", head, "-" * len(head)]
+    for cls, byL in rank[:top]:
+        at = byL.get(Lmax)
+        if not at:
+            continue
+        k = fit_exponent(lengths,
+                         [byL.get(L, {}).get("excl_s", 0.0) for L in lengths])
+        gbs = at["moved_bytes"] / at["excl_s"] / 1e9 if at["excl_s"] > 0 else 0.0
+        line = (f"{_elide(cls, w-1):<{w}}{at['calls']:>7}{at['excl_s']:>12.3f}"
+                f"{100*at['excl_s']/total:>6.1f}"
+                f"{(f'{k:.2f}' if k is not None else '-'):>7}{gbs:>9.1f}")
+        if peak:
+            frac = gbs / peak
+            v = "BW-BOUND" if frac >= 0.6 else ("part BW" if frac >= 0.25
+                                                else "not BW")
+            line += f"{100*frac:>6.0f}{v:>13}"
+        out.append(line)
+    return "\n".join(out)
+
+
+def render_verdict(rows: list[dict], per_class: dict, lengths: list[int],
+                   ceilings: Ceilings, top: int = 5) -> str:
+    """The short answer: what to look at first, and why."""
+    Lmax = max(lengths)
+    lazy = rows[-1]["lazy_share"] if rows else 0.0
+    rank = sorted(per_class.items(),
+                  key=lambda kv: kv[1].get(Lmax, {}).get("excl_s", 0.0),
+                  reverse=True)
+    total = sum(v.get(Lmax, {}).get("excl_s", 0.0) for _, v in rank) or 1.0
+
+    out = [f"== where the time goes at L={Lmax}"]
+    if lazy >= 0.40:
+        out.append(f"  Dispatch-bound: {100*lazy:.0f}% of the time is Python and "
+                   "graph build.\n  Cut op count or mx.compile. Kernels will not help.")
+    elif lazy >= 0.15:
+        out.append(f"  {100*lazy:.0f}% is Python and graph build. Real, but not "
+                   "the main cost.")
+    else:
+        out.append(f"  Device-bound: only {100*lazy:.0f}% is Python and graph "
+                   "build. Optimise the kernels.")
+    out.append("")
+    for cls, byL in rank[:top]:
+        at = byL.get(Lmax)
+        if not at or at["excl_s"] <= 0:
+            continue
+        k = fit_exponent(lengths,
+                         [byL.get(L, {}).get("excl_s", 0.0) for L in lengths])
+        gbs = at["moved_bytes"] / at["excl_s"] / 1e9
+        frac = gbs / ceilings.peak_bw_gbs
+        why = ("saturating bandwidth; fuse to cut round trips"
+               if frac >= 0.6 else
+               "not bandwidth-limited; check a gputrace for the real limiter"
+               if frac < 0.25 else "partly bandwidth-limited")
+        grow = (f", grows as L^{k:.1f}" if k is not None else "")
+        out.append(f"  {100*at['excl_s']/total:5.1f}%  {cls:<28} "
+                   f"{gbs:6.1f} GB/s ({100*frac:.0f}% of peak){grow}")
+        out.append(f"         -> {why}")
+    return "\n".join(out)

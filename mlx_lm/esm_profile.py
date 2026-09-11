@@ -1,19 +1,24 @@
-"""Profile the MLX ESM models layer by layer.
+"""Profile the MLX ESM models layer by layer, across sequence lengths.
 
     python -m mlx_lm.esm_profile ceilings
-    python -m mlx_lm.esm_profile esmc     --seq-len 578
-    python -m mlx_lm.esm_profile esmfold2 --repo biohub/ESMFold2-Fast --seq-len 578
+    python -m mlx_lm.esm_profile esmc     --seq-len 128 256 384 500
+    python -m mlx_lm.esm_profile esmfold2 --seq-len 128 256 384 500
 
-Weights are not needed. Performance depends on shapes and dtype, not values,
-so by default the model is built from its config with random init. That skips
-a multi-GB download and lets a profile run anywhere. Pass --weights to load
-the real checkpoint when you want to confirm.
+Pass several lengths and the model is built once, then swept. The sweep fits a
+scaling exponent per module class, which is the number worth having: a class
+at 10% of runtime growing as L^3 overtakes one at 30% growing as L^1. Ranking
+by current share alone is how you optimise the wrong layer.
+
+Weights are not needed. Performance follows shapes and dtype, not values, so
+the model is built from its config with random init. That skips a multi-GB
+download and lets a profile run anywhere. Pass --weights to load the real
+checkpoint when you want to confirm.
 
 Inputs are synthesised, following tests/test_models.py::test_esmfold2. One
-caveat worth knowing: the synthetic token mask has no padding, and ESMC
-short-circuits its attention mask to None when every token shares a chain id.
-A real padded or multi-chain input therefore takes a slightly different path.
-Use --chains 2 to exercise the masked path.
+caveat: the synthetic token mask has no padding, and ESMC short-circuits its
+attention mask to None when every token shares a chain id, so a real padded
+or multi-chain input takes a slightly different path. Use --chains 2 to
+exercise the masked path.
 """
 
 from __future__ import annotations
@@ -31,8 +36,15 @@ from .esm_profiler import (
     render,
     render_ceilings,
     render_modes,
+    render_scaling,
+    render_sweep,
+    render_verdict,
     save_json,
 )
+
+FLOAT = (mx.float32, mx.float16, mx.bfloat16)
+DTYPES = {"bfloat16": mx.bfloat16, "float16": mx.float16, "float32": mx.float32}
+
 
 # ---------------------------------------------------------------------------
 # synthetic inputs
@@ -88,109 +100,76 @@ TINY_ESMC = dict(hidden_size=8, num_attention_heads=2, num_hidden_layers=2)
 
 
 # ---------------------------------------------------------------------------
-# driver
+# model construction
 # ---------------------------------------------------------------------------
 
 
-def _run_phase(label, model, fn, args, ceilings, out):
-    """Warm up, then profile the same call in eval mode and lazy mode."""
-    mx.eval(fn())          # warm up: first call pays JIT and allocation
-    mx.synchronize()
-    mx.clear_cache()
-
-    prof = LayerProfiler(mode="eval").attach(model, root=args.root)
-    with prof:
-        fn()
-    eval_wall = prof.wall_s
-
-    lazy = LayerProfiler(mode="lazy", record_shapes=False).attach(
-        model, root=args.root)
-    with lazy:
-        r = lazy_out = fn()
-    lazy_wall = lazy.wall_s
-    mx.eval(lazy_out)
-    mx.synchronize()
-    del r, lazy_out
-
-    print(f"\n{'#'*78}\n# {label}   (peak {mx.get_peak_memory()/2**30:.2f} GB)\n{'#'*78}")
-    print(render_modes(eval_wall, lazy_wall))
-    print()
-    print(render(prof.active(), ceilings, total_s=None, top=args.top,
-                 title=f"{label}: slowest layers by exclusive device time"))
-    print()
-    print(render(list(prof.by_class().values()), ceilings, top=args.top,
-                 title=f"{label}: rolled up by module class", label="class"))
-    print()
-    print(render(lazy.active(), None, top=min(args.top, 12),
-                 title=f"{label}: graph-build cost only (no device work)"))
-    out[label] = {"eval": prof.as_dict(), "lazy": lazy.as_dict(),
-                  "peak_gb": mx.get_peak_memory() / 2**30}
-    return prof
+def build_esmc(args):
+    from .models import esmc
+    if args.weights:
+        return esmc.from_pretrained(args.repo, dtype=args.mx_dtype)
+    cfg = dict(TINY_ESMC) if args.tiny else dict(
+        hidden_size=args.hidden, num_attention_heads=args.heads,
+        num_hidden_layers=args.layers)
+    m = esmc.Model(esmc.ModelArgs(**cfg))
+    m.set_dtype(args.mx_dtype)
+    m.eval()
+    mx.eval(m.parameters())
+    return m
 
 
-def load_esmfold2(args):
+def build_esmfold2(args):
     from .models import esmc, esmfold2
+    if args.weights:
+        return esmfold2.ESMFold2Model.from_pretrained(args.repo, dtype=args.mx_dtype)
     if args.tiny:
-        cfg, model = TINY_CONFIG, None
+        cfg = TINY_CONFIG
     elif args.config:
         cfg = json.load(open(args.config))
     else:
         from huggingface_hub import hf_hub_download
         cfg = json.load(open(hf_hub_download(args.repo, "config.json")))
-
-    if args.weights:
-        return esmfold2.ESMFold2Model.from_pretrained(args.repo, dtype=args.mx_dtype)
-    model = esmfold2.ESMFold2Model(cfg)
-    model._esmc = esmc.Model(
+    m = esmfold2.ESMFold2Model(cfg)
+    m._esmc = esmc.Model(
         esmc.ModelArgs(**TINY_ESMC) if args.tiny
         else esmc.ModelArgs(hidden_size=cfg.get("lm_d_model", 2560),
-                            num_attention_heads=40,
+                            num_attention_heads=args.heads,
                             num_hidden_layers=cfg.get("lm_num_layers", 80)))
-    model.set_dtype(args.mx_dtype)
-    model.eval()
-    mx.eval(model.parameters())
-    return model
+    m.set_dtype(args.mx_dtype)
+    m.eval()
+    mx.eval(m.parameters())
+    return m
 
 
-def cmd_esmfold2(args):
-    model = load_esmfold2(args)
-    feats = synth_feats(args.seq_len, args.atoms_per_token, args.chains)
-    feats = {k: (v.astype(args.mx_dtype)
-                 if v.dtype in (mx.float32, mx.float16, mx.bfloat16) else v)
-             for k, v in feats.items()}
+# ---------------------------------------------------------------------------
+# phases: one closure per thing we want timed separately
+# ---------------------------------------------------------------------------
+
+
+def esmc_phases(model, L, args):
+    ids = mx.random.randint(4, 24, (1, L))
+    per = max(L // args.chains, 1)
+    amask = mx.ones((1, L), mx.bool_) if args.chains == 1 else None
+    sid = (None if args.chains == 1
+           else mx.minimum(mx.arange(L) // per, args.chains - 1)[None])
+    mx.eval(ids)
+    return {"encode": lambda: model.encode(ids, attention_mask=amask,
+                                           sequence_id=sid)}
+
+
+def esmfold2_phases(model, L, args):
+    feats = {k: (v.astype(args.mx_dtype) if v.dtype in FLOAT else v)
+             for k, v in synth_feats(L, args.atoms_per_token, args.chains).items()}
     mx.eval(list(feats.values()))
 
-    ceilings = measure_ceilings(dtype=args.mx_dtype, gemm_n=args.gemm_n)
-    print(render_ceilings(ceilings))
-    print(f"\nL={args.seq_len}  atoms={args.seq_len*args.atoms_per_token}  "
-          f"loops={args.loops}  steps={args.steps}  dtype={args.dtype}  "
-          f"weights={'real' if args.weights else 'random'}")
-    out = {"cmd": "esmfold2", "ceilings": ceilings.as_dict(),
-           "seq_len": args.seq_len, "loops": args.loops,
-           "atoms_per_token": args.atoms_per_token, "phases": {}}
-
-    mx.reset_peak_memory()
-    lm = model.compute_lm_hidden_states(
-        feats["input_ids"], asym_id=feats.get("asym_id"),
-        residue_index=feats.get("residue_index"), mol_type=feats.get("mol_type"),
-        token_mask=feats.get("token_attention_mask"))
+    lm_kw = dict(asym_id=feats.get("asym_id"),
+                 residue_index=feats.get("residue_index"),
+                 mol_type=feats.get("mol_type"),
+                 token_mask=feats.get("token_attention_mask"))
+    lm = model.compute_lm_hidden_states(feats["input_ids"], **lm_kw)
     mx.eval(lm)
-    _run_phase("phase 1/3  ESMC language model", model,
-               lambda: model.compute_lm_hidden_states(
-                   feats["input_ids"], asym_id=feats.get("asym_id"),
-                   residue_index=feats.get("residue_index"),
-                   mol_type=feats.get("mol_type"),
-                   token_mask=feats.get("token_attention_mask")),
-               args, ceilings, out["phases"])
-
-    mx.reset_peak_memory()
-    _run_phase(f"phase 2/3  trunk ({args.loops} loops)", model,
-               lambda: model.trunk(feats, lm, num_loops=args.loops),
-               args, ceilings, out["phases"])
-
     z, x_inputs, aux = model.trunk(feats, lm, num_loops=args.loops)
     mx.eval(z, x_inputs)
-    mx.reset_peak_memory()
 
     def sampler():
         mx.random.seed(0)
@@ -204,62 +183,166 @@ def cmd_esmfold2(args):
             n_tokens=aux["n_tokens"], token_attention_mask=aux["tok_mask"],
             num_diffusion_samples=1, num_sampling_steps=args.steps)
 
-    _run_phase(f"phase 3/3  diffusion sampler ({args.steps} steps)", model,
-               sampler, args, ceilings, out["phases"])
+    return {
+        "lm": lambda: model.compute_lm_hidden_states(feats["input_ids"], **lm_kw),
+        "trunk": lambda: model.trunk(feats, lm, num_loops=args.loops),
+        "sampler": sampler,
+    }
 
-    if args.gputrace:
-        with capture(args.gputrace) as ok:
-            if ok:
-                mx.eval(model.trunk(feats, lm, num_loops=1))
-        print(f"\nwrote {args.gputrace}" if ok else "\nno Metal device; no trace")
+
+# ---------------------------------------------------------------------------
+# sweep driver
+# ---------------------------------------------------------------------------
+
+
+def _profile_once(model, fn, root):
+    """Warm up, then measure the same call in eval mode and in lazy mode."""
+    mx.eval(fn())
+    mx.synchronize()
+    mx.clear_cache()
+    mx.reset_peak_memory()
+
+    prof = LayerProfiler(mode="eval", record_shapes=False).attach(model, root=root)
+    with prof:
+        fn()
+
+    lazy = LayerProfiler(mode="lazy", record_shapes=False).attach(model, root=root)
+    with lazy:
+        out = fn()
+    mx.eval(out)
+    mx.synchronize()
+    del out
+    return prof, lazy, mx.get_peak_memory() / 2**30
+
+
+def sweep(model, make_phases, args, ceilings):
+    """Profile every phase at every length. Model is built once, outside."""
+    rows, raw = [], {}
+    per_class: dict[str, dict[int, dict]] = {}
+    per_layer: dict[str, dict[int, dict]] = {}
+    detail = args.detail if args.detail else (
+        "full" if len(args.seq_len) == 1 else "summary")
+
+    for L in args.seq_len:
+        phases = make_phases(model, L, args)
+        row = {"L": L, "phase_s": {}, "lazy_s": {}, "peak_gb": 0.0}
+        raw[L] = {}
+        for label, fn in phases.items():
+            prof, lazy, peak = _profile_once(model, fn, args.root)
+            row["phase_s"][label] = prof.wall_s
+            row["lazy_s"][label] = lazy.wall_s
+            row["peak_gb"] = max(row["peak_gb"], peak)
+            raw[L][label] = {"eval": prof.as_dict(), "lazy": lazy.as_dict(),
+                             "peak_gb": peak}
+
+            for st in prof.by_class().values():
+                d = per_class.setdefault(st.cls, {}).setdefault(
+                    L, {"calls": 0, "excl_s": 0.0, "moved_bytes": 0})
+                d["calls"] += st.calls
+                d["excl_s"] += st.excl_s
+                d["moved_bytes"] += st.moved_bytes
+            for st in prof.active():
+                d = per_layer.setdefault(st.path, {}).setdefault(
+                    L, {"calls": 0, "excl_s": 0.0, "moved_bytes": 0})
+                d["calls"] += st.calls
+                d["excl_s"] += st.excl_s
+                d["moved_bytes"] += st.moved_bytes
+
+            if detail == "full":
+                print(f"\n{'#'*78}\n# L={L}  {label}   "
+                      f"(peak {peak:.2f} GB)\n{'#'*78}")
+                print(render_modes(prof.wall_s, lazy.wall_s))
+                print()
+                print(render(prof.active(), ceilings, top=args.top,
+                             title=f"L={L} {label}: slowest layers"))
+                print()
+                print(render(list(prof.by_class().values()), ceilings,
+                             top=args.top, label="class",
+                             title=f"L={L} {label}: by module class"))
+            del prof, lazy
+            mx.clear_cache()
+
+        row["total_s"] = sum(row["phase_s"].values())
+        tot_lazy = sum(row["lazy_s"].values())
+        row["lazy_share"] = tot_lazy / row["total_s"] if row["total_s"] else 0.0
+        rows.append(row)
+        if detail == "summary":
+            parts = "  ".join(f"{k} {v:.3f}s" for k, v in row["phase_s"].items())
+            print(f"  L={L:<5} {parts}   total {row['total_s']:.3f}s"
+                  f"   lazy {100*row['lazy_share']:.0f}%   peak {row['peak_gb']:.2f}GB")
+
+    return rows, per_class, per_layer, raw
+
+
+def _report(rows, per_class, per_layer, args, ceilings, extra=None):
+    phases = list(rows[0]["phase_s"]) if rows else []
+    print()
+    print(render_sweep(rows, phases))
+    print()
+    print(render_scaling(per_class, args.seq_len, ceilings, top=args.top))
+    print()
+    print(render_scaling(per_layer, args.seq_len, ceilings, top=args.top,
+                         title="per-layer scaling", label="layer"))
+    print()
+    print(render_verdict(rows, per_class, args.seq_len, ceilings,
+                         top=args.verdict_top))
     if args.json:
-        save_json(args.json, out)
+        payload = {"ceilings": ceilings.as_dict(), "rows": rows,
+                   "per_class": per_class, "per_layer": per_layer,
+                   "args": {k: v for k, v in vars(args).items()
+                            if isinstance(v, (int, float, str, bool, list))}}
+        if extra:
+            payload.update(extra)
+        save_json(args.json, payload)
         print(f"\nwrote {args.json}")
+
+
+# ---------------------------------------------------------------------------
+# subcommands
+# ---------------------------------------------------------------------------
 
 
 def cmd_esmc(args):
-    from .models import esmc
-    if args.weights:
-        model = esmc.from_pretrained(args.repo, dtype=args.mx_dtype)
-    else:
-        cfg = dict(TINY_ESMC) if args.tiny else dict(
-            hidden_size=args.hidden, num_attention_heads=args.heads,
-            num_hidden_layers=args.layers)
-        model = esmc.Model(esmc.ModelArgs(**cfg))
-        model.set_dtype(args.mx_dtype)
-        model.eval()
-        mx.eval(model.parameters())
-
+    model = build_esmc(args)
     a = model.args
     ceilings = measure_ceilings(dtype=args.mx_dtype, gemm_n=args.gemm_n)
     print(render_ceilings(ceilings))
-    print(f"\nL={args.seq_len}  hidden={a.hidden_size}  heads={a.num_attention_heads}"
-          f"  layers={a.num_hidden_layers}  ffn={a.ffn_hidden}  dtype={args.dtype}"
-          f"  weights={'real' if args.weights else 'random'}")
+    print(f"\nESMC  hidden={a.hidden_size} heads={a.num_attention_heads} "
+          f"layers={a.num_hidden_layers} ffn={a.ffn_hidden}  "
+          f"dtype={args.dtype}  weights={'real' if args.weights else 'random'}")
+    print(f"sweeping L = {args.seq_len}\n")
+    rows, per_class, per_layer, raw = sweep(model, esmc_phases, args, ceilings)
+    _report(rows, per_class, per_layer, args, ceilings,
+            extra={"cmd": "esmc", "raw": raw} if args.raw else {"cmd": "esmc"})
+    _maybe_trace(args, model, esmc_phases)
 
-    ids = mx.random.randint(4, 24, (1, args.seq_len))
-    per = max(args.seq_len // args.chains, 1)
-    amask = mx.ones((1, args.seq_len), mx.bool_) if args.chains == 1 else None
-    sid = (None if args.chains == 1
-           else mx.minimum(mx.arange(args.seq_len) // per, args.chains - 1)[None])
-    mx.eval(ids)
-    out = {"cmd": "esmc", "ceilings": ceilings.as_dict(),
-           "seq_len": args.seq_len, "config": {
-               "hidden": a.hidden_size, "heads": a.num_attention_heads,
-               "layers": a.num_hidden_layers, "ffn": a.ffn_hidden},
-           "phases": {}}
-    mx.reset_peak_memory()
-    _run_phase(f"ESMC encode (L={args.seq_len})", model,
-               lambda: model.encode(ids, attention_mask=amask, sequence_id=sid),
-               args, ceilings, out["phases"])
-    if args.gputrace:
-        with capture(args.gputrace) as ok:
-            if ok:
-                mx.eval(model.encode(ids, attention_mask=amask, sequence_id=sid))
-        print(f"\nwrote {args.gputrace}" if ok else "\nno Metal device; no trace")
-    if args.json:
-        save_json(args.json, out)
-        print(f"\nwrote {args.json}")
+
+def cmd_esmfold2(args):
+    model = build_esmfold2(args)
+    ceilings = measure_ceilings(dtype=args.mx_dtype, gemm_n=args.gemm_n)
+    print(render_ceilings(ceilings))
+    print(f"\nESMFold2  loops={args.loops} steps={args.steps} "
+          f"atoms/token={args.atoms_per_token}  dtype={args.dtype}  "
+          f"weights={'real' if args.weights else 'random'}")
+    print(f"sweeping L = {args.seq_len}\n")
+    rows, per_class, per_layer, raw = sweep(model, esmfold2_phases, args, ceilings)
+    _report(rows, per_class, per_layer, args, ceilings,
+            extra={"cmd": "esmfold2", "raw": raw} if args.raw
+            else {"cmd": "esmfold2"})
+    _maybe_trace(args, model, esmfold2_phases)
+
+
+def _maybe_trace(args, model, make_phases):
+    if not args.gputrace:
+        return
+    L = args.seq_len[0]
+    phases = make_phases(model, L, args)
+    label = args.trace_phase or list(phases)[-1]
+    with capture(args.gputrace) as ok:
+        if ok:
+            mx.eval(phases[label]())
+    print(f"\nwrote {args.gputrace}  (L={L}, phase={label})" if ok
+          else "\nno Metal device; no trace written")
 
 
 def cmd_ceilings(args):
@@ -269,16 +352,19 @@ def cmd_ceilings(args):
         save_json(args.json, c.as_dict())
 
 
-DTYPES = {"bfloat16": mx.bfloat16, "float16": mx.float16, "float32": mx.float32}
-
-
 def main():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--dtype", default="bfloat16", choices=list(DTYPES))
-    common.add_argument("--top", type=int, default=25)
-    common.add_argument("--json", default=None, help="write raw records here")
+    common.add_argument("--top", type=int, default=20)
+    common.add_argument("--verdict-top", type=int, default=5)
+    common.add_argument("--detail", default=None, choices=["full", "summary"],
+                        help="default: full for one length, summary for a sweep")
+    common.add_argument("--json", default=None, help="write records here")
+    common.add_argument("--raw", action="store_true",
+                        help="include every per-length record in the json")
     common.add_argument("--gputrace", default=None,
-                        help="also write a .gputrace (needs MTL_CAPTURE_ENABLED=1)")
+                        help=".gputrace path (needs MTL_CAPTURE_ENABLED=1)")
+    common.add_argument("--trace-phase", default=None)
     common.add_argument("--gemm-n", type=int, default=4096)
     common.add_argument("--root", default="model")
     common.add_argument("--tiny", action="store_true",
@@ -287,15 +373,16 @@ def main():
                         help="load the real checkpoint instead of random init")
     common.add_argument("--chains", type=int, default=1)
 
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     c = sub.add_parser("ceilings", parents=[common])
-    c.set_defaults(fn=cmd_ceilings, seq_len=0)
+    c.set_defaults(fn=cmd_ceilings, seq_len=[0])
 
     e = sub.add_parser("esmc", parents=[common])
-    e.add_argument("--seq-len", type=int, default=578)
+    e.add_argument("--seq-len", type=int, nargs="+",
+                   default=[64, 128, 192, 256, 320, 384, 448, 500])
     e.add_argument("--hidden", type=int, default=2560)
     e.add_argument("--heads", type=int, default=40)
     e.add_argument("--layers", type=int, default=80)
@@ -303,16 +390,19 @@ def main():
     e.set_defaults(fn=cmd_esmc)
 
     f = sub.add_parser("esmfold2", parents=[common])
-    f.add_argument("--seq-len", type=int, default=578)
+    f.add_argument("--seq-len", type=int, nargs="+",
+                   default=[64, 128, 192, 256, 320, 384, 448, 500])
     f.add_argument("--atoms-per-token", type=int, default=8)
     f.add_argument("--loops", type=int, default=3)
     f.add_argument("--steps", type=int, default=14)
+    f.add_argument("--heads", type=int, default=40)
     f.add_argument("--repo", default="biohub/ESMFold2-Fast")
     f.add_argument("--config", default=None, help="local config.json")
     f.set_defaults(fn=cmd_esmfold2)
 
     args = p.parse_args()
     args.mx_dtype = DTYPES[args.dtype]
+    args.seq_len = sorted(set(args.seq_len))
     t0 = time.perf_counter()
     args.fn(args)
     print(f"\ntotal harness time {time.perf_counter()-t0:.1f}s")
