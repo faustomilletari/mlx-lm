@@ -40,6 +40,7 @@ from .esm_profiler import (
     render_modes,
     render_scaling,
     render_memory,
+    render_shapes,
     render_sweep,
     render_verdict,
     save_json,
@@ -213,14 +214,14 @@ def esmfold2_phases(model, L, args):
 # ---------------------------------------------------------------------------
 
 
-def _profile_once(model, fn, root):
+def _profile_once(model, fn, root, shapes=False):
     """Warm up, then measure the same call in eval mode and in lazy mode."""
     mx.eval(fn())
     mx.synchronize()
     mx.clear_cache()
     mx.reset_peak_memory()
 
-    prof = LayerProfiler(mode="eval", record_shapes=False).attach(model, root=root)
+    prof = LayerProfiler(mode="eval", record_shapes=shapes).attach(model, root=root)
     with prof:
         fn()
 
@@ -259,7 +260,8 @@ def sweep(model, make_phases, args, ceilings):
             with bypass_compile(model) as n_bypassed:
                 row["bypassed_s"][label] = time_plain(fn) if n_bypassed else \
                     row["plain_s"][label]
-                prof, lazy, peak = _profile_once(model, fn, args.root)
+                prof, lazy, peak = _profile_once(model, fn, args.root,
+                                                 shapes=args.shapes)
 
             row["phase_s"][label] = prof.wall_s
             row["lazy_s"][label] = lazy.wall_s
@@ -283,6 +285,11 @@ def sweep(model, make_phases, args, ceilings):
                     d["moved_bytes"] += st.moved_bytes
                     d["flops"] += st.flops
 
+            if args.shapes and L == args.seq_len[-1]:
+                print(f"\n{'#'*78}\n# L={L}  {label}: real shapes and per-call "
+                      f"cost\n{'#'*78}")
+                print(render_shapes(prof.active(), ceilings, top=args.top,
+                                    title=f"L={L} {label}"))
             if detail == "full":
                 print(f"\n{'#'*78}\n# L={L}  {label}   "
                       f"(peak {peak:.2f} GB)\n{'#'*78}")
@@ -479,13 +486,40 @@ def cmd_micro(args):
             2 * nbytes)
         row("sigmoid (elementwise ref)", lambda: mx.sigmoid(z), 2 * nbytes)
 
+        # The model does not hand LayerNorm a contiguous tensor.
+        # TriangleMultiplicativeUpdate._contract builds (B, D, i, j) and
+        # returns out.transpose(0, 2, 3, 1), so the axis LayerNorm reduces
+        # over is strided by i*j. Time that, not just the tidy case.
+        print(f"\n  -- as the model actually calls it: strided reduction axis")
+        raw = mx.random.normal((1, D, L, L)).astype(mx.float32)
+        mx.eval(raw)
+        sv = raw.transpose(0, 2, 3, 1)          # (1, L, L, D), D strided
+        pe = nn.Linear(D, D, bias=False)
+        pe.set_dtype(dt)
+        mx.eval(pe.parameters())
+
+        row("astype(bf16) on strided view", lambda: sv.astype(dt), 2 * nbytes)
+        row("layer_norm(strided astype)  <- MODEL PATH",
+            lambda: mx.fast.layer_norm(sv.astype(dt), g, b, 1e-5), 2 * nbytes)
+        row("layer_norm(contiguous(strided))",
+            lambda: mx.fast.layer_norm(
+                mx.contiguous(sv).astype(dt), g, b, 1e-5), 2 * nbytes)
+        row("proj_emit(layer_norm(strided))",
+            lambda: pe(mx.fast.layer_norm(sv.astype(dt), g, b, 1e-5)),
+            2 * nbytes)
+        row("proj_emit(layer_norm(contiguous))",
+            lambda: pe(mx.fast.layer_norm(
+                mx.contiguous(sv).astype(dt), g, b, 1e-5)), 2 * nbytes)
+
         out["cases"].extend(rows)
-        del z, z2, g, b, ln
+        del z, z2, g, b, ln, raw, sv, pe
         mx.clear_cache()
 
     print("\n  Read it like this: any LayerNorm row far above the copy floor "
           "is\n  a kernel problem, not an unavoidable cost. The floor is the "
           "least\n  any op touching this tensor can possibly take.")
+    print("  If MODEL PATH is far above the contiguous row, the cost is the "
+          "stride,\n  not the normalisation, and one mx.contiguous fixes it.")
     if args.json:
         save_json(args.json, out)
         print(f"\nwrote {args.json}")
@@ -525,6 +559,9 @@ def main():
     common.add_argument("--weights", action="store_true",
                         help="load the real checkpoint instead of random init")
     common.add_argument("--chains", type=int, default=1)
+    common.add_argument("--shapes", action="store_true",
+                        help="print real input shapes and ms/call for the "
+                             "slowest layers at the longest length")
     common.add_argument("--skip-lm", action="store_true",
                         help="do not build ESMC (~16 GB); synthesise its "
                              "hidden states and profile trunk + sampler only")

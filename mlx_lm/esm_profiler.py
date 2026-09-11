@@ -759,3 +759,27 @@ def render_memory(peak_gb: float, info: Optional[dict] = None) -> str:
         else:
             out.append("  => headroom is fine; timings are not swap-contaminated.")
     return "\n".join(out)
+
+
+def render_shapes(stats: list[ModuleStat], ceilings: Optional[Ceilings] = None,
+                  top: int = 25, title: str = "actual shapes") -> str:
+    """Per-call cost next to the real input shape.
+
+    Aggregates hide this. A class total tells you nothing about whether one
+    call is slow or there are simply many, and an assumed shape is how you
+    end up benchmarking a tensor the model never produces.
+    """
+    rows = sorted(stats, key=lambda s: s.excl_s, reverse=True)
+    w = 38
+    head = (f"{'layer':<{w}}{'cls':>18}{'calls':>7}{'ms/call':>10}"
+            f"{'MB/call':>9}{'GB/s':>8}  input shapes")
+    out = [f"== {title}", head, "-" * (len(head) + 18)]
+    for s in rows[:top]:
+        g = s.gbs()
+        shp = "; ".join(str(x) for x in (s.shapes[0] if s.shapes else [])) or "-"
+        out.append(
+            f"{_elide(s.path, w-1):<{w}}{s.cls[:17]:>18}{s.calls:>7}"
+            f"{1e3*s.excl_s/max(s.calls,1):>10.2f}"
+            f"{s.moved_bytes/max(s.calls,1)/2**20:>9.1f}"
+            f"{(f'{g:.1f}' if g else '-'):>8}  {shp[:60]}")
+    return "\n".join(out)
