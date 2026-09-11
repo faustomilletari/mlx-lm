@@ -346,6 +346,83 @@ being optimistic by ~33% twice.
 | + bf16 trunk + contraction | 20.052s | 1.300x |
 | + channel-first TriMul | **~18.90s** | **~1.379x** |
 
+## The GPU is saturated. This closes a whole line of enquiry.
+
+`devtools/gpu_busy.py`, L=500, powermetrics:
+
+| workload | residency | power | freq |
+|---|---|---|---|
+| one large GEMM (control) | 94.6% | 21.8 W | 1503 MHz |
+| one large elementwise (control) | 94.9% | 9.2 W | 1509 MHz |
+| **trunk** | **100.0%** (min 100, max 100) | **23.0 W** | **1578 MHz** |
+
+The trunk is *more* saturated than a bare GEMM loop, and draws more power at a
+higher clock than either control.
+
+**There are no dispatch bubbles.** Every wall-clock "% of roof" number in this
+file is therefore honest -- none of them was hiding idle GPU. It also means
+reducing kernel count buys nothing. The only levers left are better kernels
+and less work.
+
+## LayerNorm -> GEMM fusion: measured ceiling, then dropped
+
+Section F of the trimul bench, L=500:
+
+| variant | ms |
+|---|---|
+| `layer_norm(z)` alone | 1.33 |
+| `proj(layer_norm(z))` as the model runs it | 23.21 |
+| `proj(pre-normalised)`, GEMM only | 22.08 |
+| row mean+var only | 3.88 |
+| implied best fused | 25.96, **worse** |
+
+The norm adds only **1.13ms on top of the GEMM**, because MLX already overlaps
+it. Ceiling is 1.13ms x 306 pairs = 0.35s, **1.8%**, and a real fused kernel
+still needs a stats pass so it would get less. I had estimated 5%; that was
+LayerNorm's whole share, which fusion cannot remove. **Do not write it.**
+
+## ESMC, first look
+
+Never profiled before. L=500, random weights, bf16:
+
+| class | time | share | rate |
+|---|---|---|---|
+| `Linear` | 1.285s | 81.0% | 4.94 TFLOP/s, **82% of GEMM roof** |
+| `Attention` | 0.136s | 8.6% | container |
+| `LayerNorm` | 0.065s | 4.1% | 25.5 GB/s, 15% of BW |
+| rest | ~0.1s | 6% | — |
+
+About 1.6s total, ~8% of a full fold. `Linear` sits at **396.9 FLOP/byte**, far
+above every ridge point, so ESMC is strongly compute-bound and gets faster for
+free on an M5 Ultra. Peak memory 11.86 GB for the 7.8B-param shim.
+
+Little to win: 82% of roof on 81% of the phase.
+
+## Sampler: SWA3DRoPEAttention builds a dense N x N mask
+
+Found by reading, not measuring. For a +/-64 sliding window it materialises the
+full mask and calls dense attention. At N=4000 atoms, per call:
+
+| step | intermediate |
+|---|---|
+| `rank[:,:,None] - rank[:,None,:]` | 61 MB int32 |
+| `mx.abs(...)` | 61 MB int32 |
+| `<=`, the two `&`, `eye`, `\|` | 76 MB bool |
+| **~mask traffic** | **~397 MB, 2.2ms at 190 GB/s** |
+
+| attention | GFLOP |
+|---|---|
+| dense N x N | 8.19 |
+| needed (N x 129) | 0.26 |
+| **wasted** | **31x** |
+
+Measured 7.19ms per call, 63 calls, 0.460s. **And the mask is identical on all
+63 calls** -- `valid` and `N` are constant for a fold, so 397 MB is rebuilt 62
+times for nothing. At N=8000 that intermediate is 244 MB.
+
+Two fixes: cache the mask (trivial), or block-sparse the attention (real work).
+Together ~1.5-2% of the run, and it stops the mask exploding at long chains.
+
 ## Harness bugs that invalidated earlier numbers
 
 Read this before comparing against anything older than the commit named.
@@ -357,6 +434,12 @@ Read this before comparing against anything older than the commit named.
 | Container modules reported bandwidth | Full tensor bytes over exclusive-only time. `DiffusionModule` showed 1081% of peak. | `a18a68c` |
 | Param bytes double-counted in class rollups | Inflated aggregate traffic | `0200862` |
 | `_elide` destroyed numeric path components | `abbr("17")` returned `"1"`, so seventeen blocks rendered as one row | `e941afa` |
+| `mx.eval` on a dataclass evaluates nothing | ESMC's `encode()` returns `EsmcOutput`, so every ESMC phase timing was graph construction: 0.001s at every length, scaling `L^-0.26` | `1e4c7b2` |
+| raw matmuls are not counted as FLOPs | channel-first TriMul calls `proj_bundle.weight @ x.T` directly, bypassing `nn.Linear.__call__`. Its GEMM moved out of `Linear` (14.458s -> 10.031s) into TriMul's body (5.859s -> 9.147s), which then read as 5.7 GB/s and `HEADROOM` on what is mostly a GEMM at 92% of roof | `1e4c7b2` |
+
+The second of those is worth remembering as a design smell, not just a harness
+bug: bypassing `nn.Linear` also means any future Linear-level work, quantisation
+above all, will silently skip `proj_bundle`.
 
 Phase totals, scaling exponents and the dtype audit were never affected: they
 come from uninstrumented runs or from byte counts.

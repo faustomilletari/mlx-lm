@@ -31,6 +31,7 @@ import mlx.core as mx
 
 from .esm_profiler import (
     LayerProfiler,
+    _force,
     bypass_compile,
     capture,
     measure_ceilings,
@@ -218,7 +219,7 @@ def esmfold2_phases(model, L, args):
 
 def _profile_once(model, fn, root, shapes=False):
     """Warm up, then measure the same call in eval mode and in lazy mode."""
-    mx.eval(fn())
+    _force(fn())
     mx.synchronize()
     mx.clear_cache()
     mx.reset_peak_memory()
@@ -230,7 +231,7 @@ def _profile_once(model, fn, root, shapes=False):
     lazy = LayerProfiler(mode="lazy", record_shapes=False).attach(model, root=root)
     with lazy:
         out = fn()
-    mx.eval(out)
+    _force(out)
     mx.synchronize()
     del out
     return prof, lazy, mx.get_peak_memory() / 2**30

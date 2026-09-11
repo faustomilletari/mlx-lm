@@ -19,6 +19,7 @@ is an upper bound. Confirm the top offenders with a .gputrace.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import time
@@ -36,7 +37,12 @@ from mlx.utils import tree_flatten
 
 
 def iter_arrays(obj: Any) -> Iterator[mx.array]:
-    """Every mx.array reachable through tuples, lists and dicts."""
+    """Every mx.array reachable through tuples, lists, dicts and dataclasses.
+
+    Dataclasses matter: ESMC's encode() returns EsmcOutput, so without this
+    mx.eval() received an object holding no arrays, evaluated nothing, and
+    every ESMC phase timing measured graph construction instead of the model.
+    """
     if isinstance(obj, mx.array):
         yield obj
     elif isinstance(obj, (list, tuple)):
@@ -45,6 +51,9 @@ def iter_arrays(obj: Any) -> Iterator[mx.array]:
     elif isinstance(obj, dict):
         for o in obj.values():
             yield from iter_arrays(o)
+    elif dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        for f in dataclasses.fields(obj):
+            yield from iter_arrays(getattr(obj, f.name, None))
 
 
 _DT_SHORT = {"float32": "f32", "bfloat16": "bf16", "float16": "f16",
@@ -81,6 +90,27 @@ def _walk_for_modules(v: Any) -> Iterator[nn.Module]:
 def _all_param_bytes(m: nn.Module) -> int:
     return sum(v.nbytes for _, v in tree_flatten(m.parameters())
                if isinstance(v, mx.array))
+
+
+def _trimul_flops(mod, args) -> float:
+    """proj_bundle plus the contraction, for one TriMul call.
+
+    Channel-first TriMul computes `proj_bundle.weight @ x.T` directly rather
+    than calling the Linear, so those FLOPs are invisible to the per-module
+    Linear counter and the class reads as pure bandwidth. proj_emit and
+    proj_gate are still Linear calls and stay counted there.
+    """
+    z = next(iter_arrays(args), None)
+    if z is None or z.ndim != 4:
+        return 0.0
+    _, li, lj, d = z.shape
+    m_rows = z.size // d
+    bundle = 2.0 * m_rows * d * 4 * d
+    contraction = 2.0 * d * li * lj * lj
+    return bundle + contraction
+
+
+CLASS_FLOPS = {"TriangleMultiplicativeUpdate": _trimul_flops}
 
 
 def _linear_shape(m: nn.Module) -> tuple:
@@ -133,11 +163,11 @@ class Ceilings:
 
 def _time_op(fn: Callable[[], Any], iters: int = 20, warmup: int = 5) -> float:
     for _ in range(warmup):
-        mx.eval(fn())
+        _force(fn())
     mx.synchronize()
     t0 = time.perf_counter()
     for _ in range(iters):
-        mx.eval(fn())
+        _force(fn())
     mx.synchronize()
     return (time.perf_counter() - t0) / iters
 
@@ -195,6 +225,7 @@ class ModuleStat:
     alloc_delta: int = 0
     flops: float = 0.0      # exact, counted only where we can (Linear)
     gemm_shape: tuple = ()  # (in_features, out_features) for Linear
+    flops_fn: Any = None    # for modules doing raw matmuls, not nn.Linear
     shapes: list = field(default_factory=list)
 
     @property
@@ -290,7 +321,8 @@ class LayerProfiler:
             self.stats[path] = ModuleStat(
                 path=path, cls=type(mod).__name__,
                 own_params=own_param_bytes(mod),
-                gemm_shape=_linear_shape(mod))
+                gemm_shape=_linear_shape(mod),
+                flops_fn=CLASS_FLOPS.get(type(mod).__name__))
             for klass in type(mod).__mro__:
                 if "__call__" in klass.__dict__ and klass is not nn.Module:
                     classes[klass] = None
@@ -393,6 +425,8 @@ class LayerProfiler:
             in_f, out_f = st.gemm_shape
             rows = sum(a.size for a in iter_arrays(args)) // max(in_f, 1)
             st.flops += 2.0 * rows * in_f * out_f
+        elif st.flops_fn is not None:
+            st.flops += st.flops_fn(module, args)
         st.alloc_delta += mx.get_active_memory() - alloc0
         if self._stack:
             self._stack[-1][2] += incl
@@ -762,14 +796,25 @@ def bypass_compile(model: nn.Module,
             mod.__dict__[attr] = original
 
 
+def _force(out: Any) -> None:
+    """Evaluate every array in `out`, whatever container it arrived in.
+
+    mx.eval on a dataclass evaluates nothing, silently. That is how ESMC's
+    encode() -- which returns EsmcOutput -- reported 0.001s at every length.
+    """
+    arrays = list(iter_arrays(out))
+    if arrays:
+        mx.eval(arrays)
+
+
 def time_plain(fn: Callable[[], Any], warmup: int = 1) -> float:
     """Wall time with nothing attached: the number to trust for totals."""
     for _ in range(warmup):
-        mx.eval(fn())
+        _force(fn())
     mx.synchronize()
     t0 = time.perf_counter()
     out = fn()
-    mx.eval(out)
+    _force(out)
     mx.synchronize()
     dt = time.perf_counter() - t0
     del out
