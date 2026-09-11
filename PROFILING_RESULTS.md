@@ -41,6 +41,9 @@ bf16 weights and pushes peak from 7.7 GB to 33 GB.
 | 1. + bf16 FoldingTrunk | 21.200s | 1.115s | 22.314s | 5.33 GB | 1.18x |
 | 2. + bf16 TriMul contraction | **20.108s** | 1.114s | **21.222s** | **4.64 GB** | **1.244x** |
 
+The 1.244x compares across sessions. The paired same-session sweep below gives
+**1.300x** at L=500, which is the number to quote.
+
 Stages 1 and 2 are now merged to main (PRs #6 and #7). Structural output at
 stage 2 is bit-identical to stage 1: once the trunk is bf16, the old
 `routed.astype(mx.float32)` is a lossless upcast and MLX accumulates the matmul
@@ -116,7 +119,44 @@ short lengths are less efficient. At L=128, M=16384 and `w12` tiles poorly.
 share goes 27% -> ~32% while `Linear` falls 53% -> ~48%. **Fusing TriMul gets
 more valuable at longer chains and on a bigger chip, not less.**
 
-No stage-2 sweep yet.
+### Paired sweep: fp32 (`8a8efde`) vs bf16 (`0f89403`)
+
+Run back to back in one session, ceilings 188.1 vs 186.8 GB/s (0.7% apart).
+**This is the trustworthy speedup measurement**; cross-session numbers carry
+the ~4% variance recorded below.
+
+| L | trunk fp32 | trunk bf16 | speedup | total fp32 | total bf16 | speedup | peak fp32 | peak bf16 |
+|---|---|---|---|---|---|---|---|---|
+| 128 | 1.495s | 1.177s | 1.270x | 1.718s | 1.396s | 1.231x | 2.36 GB | 1.46 GB |
+| 256 | 6.219s | 4.886s | 1.273x | 6.667s | 5.321s | 1.253x | 2.96 GB | 1.90 GB |
+| 384 | 14.470s | 11.341s | 1.276x | 15.226s | 12.088s | 1.260x | 4.87 GB | 3.04 GB |
+| 500 | 26.062s | 20.052s | **1.300x** | 27.175s | 21.163s | **1.284x** | 7.71 GB | 4.64 GB |
+
+Trunk exponent 2.09 -> 2.08, total 2.02 -> 1.99. **bf16 is a constant-factor
+win, not a change of scaling**, so it should hold at L=1000 and beyond.
+Speedup is flat-to-slightly-rising with length, 1.27x -> 1.30x. Peak memory is
+a consistent 0.60-0.64x.
+
+Sampler is untouched by both changes: 1.113s -> 1.112s at L=500, still 98.8%
+fp32, scaling L^1.18.
+
+### Per-class exponents, bf16, same sweep
+
+| Class | L=500 | share | L^k | vs fp32 exponent |
+|---|---|---|---|---|
+| `Linear` | 14.458s | 59.7% | 1.66 | 1.69 |
+| `TriangleMultiplicativeUpdate` | 5.859s | 24.2% | **2.16** | 2.08 (**rose**) |
+| `LayerNorm` | 1.183s | 4.9% | 1.49 | 1.70 |
+| `SwiGLUMLP` | 1.135s | 4.7% | 1.75 | 1.89 |
+| `PairUpdateBlock` | 0.537s | 2.2% | 1.45 | 1.61 |
+| `SWA3DRoPEAttention` | 0.453s | 1.9% | 1.51 | 1.52 |
+
+Every exponent fell except TriMul's, which rose. It is now the fastest-growing
+significant class by a clear margin.
+
+Extrapolated to L=1000 from the bf16 fits: trunk ~85s, with `Linear` ~54%,
+**`TriMul` ~31%** (up from 24.2%), `SwiGLUMLP` ~4.5%, `LayerNorm` ~3.9%,
+sampler ~3%.
 
 ## Run-to-run variance
 
