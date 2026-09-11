@@ -860,6 +860,11 @@ def cmd_trimul(args):
         print(f"\nwrote {args.json}")
 
 
+def _fold_entry(args):
+    from .esm_fold_bench import cmd_fold
+    cmd_fold(args)
+
+
 def _gemm_entry(args):
     from .esm_gemm_bench import cmd_gemm
     cmd_gemm(args)
@@ -952,6 +957,18 @@ def main():
     gm.add_argument("--pad-check", type=int, nargs="+",
                     default=[448, 500, 504, 512, 576])
     gm.set_defaults(fn=_gemm_entry)
+
+    fd = sub.add_parser("fold", parents=[common])
+    fd.add_argument("--seq-len", type=int, nargs="+",
+                    default=[100, 200, 300, 500, 750, 1000])
+    fd.add_argument("--atoms-per-token", type=int, default=8)
+    fd.add_argument("--loops", type=int, default=3)
+    fd.add_argument("--steps", type=int, default=14)
+    fd.add_argument("--heads", type=int, default=40)
+    fd.add_argument("--repo", default="biohub/ESMFold2-Fast")
+    fd.add_argument("--config", default=None)
+    fd.add_argument("--max-peak-gb", type=float, default=None)
+    fd.set_defaults(fn=_fold_entry)
     mi.set_defaults(fn=cmd_micro)
 
     args = p.parse_args()
