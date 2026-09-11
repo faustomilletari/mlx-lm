@@ -549,6 +549,38 @@ def cmd_micro(args):
             del x, gw, bw_
             mx.clear_cache()
 
+    # The trunk's GEMM shapes, in both dtypes. Two questions in one table:
+    # does bf16 raise the GEMM ceiling at all on this chip, and is w3's poor
+    # efficiency a shape problem? w3 has N=256, which tiles badly.
+    print("\n== the trunk's actual GEMM shapes, fp32 vs bf16")
+    M = max(args.seq_len) ** 2
+    shapes = [("trimul proj_bundle", 256, 1024), ("trimul proj_emit/gate", 256, 256),
+              ("pair_transition w12", 256, 2048), ("pair_transition w3", 1024, 256)]
+    hdr = (f"  {'op':<24}{'M':>9}{'K':>6}{'N':>6}"
+           f"{'f32 ms':>9}{'f32 TF':>8}{'bf16 ms':>9}{'bf16 TF':>9}{'bf16 win':>10}")
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for name, K, N in shapes:
+        res = {}
+        for edt in (mx.float32, mx.bfloat16):
+            x = mx.random.normal((M, K)).astype(edt)
+            w = mx.random.normal((N, K)).astype(edt)
+            mx.eval(x, w)
+            t = _time_op(lambda: x @ w.T, iters=max(args.iters // 4, 3))
+            res[edt] = (t, 2.0 * M * K * N / t / 1e12)
+            del x, w
+            mx.clear_cache()
+        t32, f32 = res[mx.float32]
+        t16, f16 = res[mx.bfloat16]
+        print(f"  {name:<24}{M:>9}{K:>6}{N:>6}{t32*1e3:>9.1f}{f32:>8.2f}"
+              f"{t16*1e3:>9.1f}{f16:>9.2f}{t32/t16:>9.2f}x")
+        out["cases"].append({"op": f"gemm/{name}", "M": M, "K": K, "N": N,
+                             "f32_ms": t32 * 1e3, "f32_tflops": f32,
+                             "bf16_ms": t16 * 1e3, "bf16_tflops": f16})
+    print("  bf16 win ~1.0x means bf16 does not raise the compute ceiling on "
+          "this chip,\n  so the GEMMs gain only from halved bytes, not faster "
+          "maths.")
+
     print("\n  Read it like this: any LayerNorm row far above the copy floor "
           "is\n  a kernel problem, not an unavoidable cost. The floor is the "
           "least\n  any op touching this tensor can possibly take.")
