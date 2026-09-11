@@ -603,6 +603,162 @@ def _manual_ln(x, g, b, eps=1e-5):
     return (((f - mu) * mx.rsqrt(var + eps)).astype(x.dtype)) * g + b
 
 
+def cmd_trimul(args):
+    """Phase 1: measure TriMul's parts before writing any fused kernel.
+
+    Four questions, each of which decides whether a fusion is worth writing:
+
+      1. Do `_contract`'s transposes materialise, or does MLX fold them into
+         the GEMM? If they are free, ~0.8s of the estimate evaporates.
+      2. Does `mx.split` on the last axis cost anything? Both halves are
+         strided views with stride 2*width.
+      3. How much of the gating chain does mx.compile already fuse? The trunk
+         runs inside a compiled FoldingTrunk, so anything compile gets is
+         already ours.
+      4. Is mx.einsum a better contraction path than transpose + matmul?
+
+    Timed at production shapes: M = L^2 rows, c_z channels, bf16.
+    """
+    import mlx.nn as nn
+
+    from .esm_profiler import _time_op
+    from .models.esmfold2 import TriangleMultiplicativeUpdate
+
+    c = measure_ceilings(dtype=args.mx_dtype, gemm_n=args.gemm_n)
+    print(render_ceilings(c))
+    D, dt = args.c_z, args.mx_dtype
+    it = args.iters
+    out = {"ceilings": c.as_dict(), "cases": []}
+
+    for L in args.seq_len:
+        pair_mib = L * L * D * mx.zeros(1, dtype=dt).itemsize / 2**20
+        print(f"\n{'='*78}\n L={L}   pair tensor (1,{L},{L},{D}) "
+              f"{pair_mib:.0f} MiB   c_z={D}\n{'='*78}")
+
+        def row(sect, name, fn, moved=None, flops=None, base=None):
+            t = _time_op(fn, iters=it)
+            gbs = f"{moved/t/1e9:8.1f}" if moved else f"{'-':>8}"
+            tf = f"{flops/t/1e12:8.2f}" if flops else f"{'-':>8}"
+            rel = f"{t/base:7.2f}x" if base else f"{'-':>8}"
+            print(f"  {name:<42}{t*1e3:>9.2f}{gbs}{tf}{rel}")
+            out["cases"].append({"L": L, "section": sect, "op": name,
+                                 "ms": t * 1e3})
+            return t
+
+        hdr = f"  {'variant':<42}{'ms':>9}{'GB/s':>8}{'TFLOP/s':>8}{'vs base':>8}"
+
+        # ---- ground truth: the real module, production shape ------------
+        tm = TriangleMultiplicativeUpdate(dim=D, outgoing=True)
+        tm.set_dtype(dt)
+        tm.eval()
+        z = mx.random.normal((1, L, L, D)).astype(dt)
+        m = mx.ones((1, L, L)).astype(dt)
+        mx.eval(tm.parameters(), z, m)
+
+        print("\n-- A. whole module, for comparison against the profiler")
+        print(hdr)
+        print("  " + "-" * (len(hdr) - 2))
+        t_mod = row("A", "TriangleMultiplicativeUpdate(z, mask)",
+                    lambda: tm(z, mask=m))
+        compiled_tm = mx.compile(lambda a, b: tm(a, mask=b))
+        row("A", "same, inside mx.compile", lambda: compiled_tm(z, m),
+            base=t_mod)
+
+        # ---- B. the contraction ----------------------------------------
+        left = mx.random.normal((1, L, L, D)).astype(dt)
+        right = mx.random.normal((1, L, L, D)).astype(dt)
+        mx.eval(left, right)
+        f_contract = 2.0 * D * L ** 3
+        lt = left.transpose(0, 3, 1, 2)
+        rt = right.transpose(0, 3, 1, 2)
+        ltc, rtc = mx.contiguous(lt), mx.contiguous(rt)
+        mx.eval(ltc, rtc)
+
+        print("\n-- B. the contraction: do the transposes materialise?")
+        print(hdr)
+        print("  " + "-" * (len(hdr) - 2))
+        t_as = row("B", "_contract as written (3 transposes)",
+                   lambda: tm._contract(left, right), flops=f_contract)
+        row("B", "pre-transposed in, transpose out",
+            lambda: (ltc @ rtc.transpose(0, 1, 3, 2)).transpose(0, 2, 3, 1),
+            flops=f_contract, base=t_as)
+        row("B", "pre-transposed in, no transpose out",
+            lambda: ltc @ rtc.transpose(0, 1, 3, 2),
+            flops=f_contract, base=t_as)
+        row("B", "mx.einsum bikd,bjkd->bijd",
+            lambda: mx.einsum("bikd,bjkd->bijd", left, right),
+            flops=f_contract, base=t_as)
+        row("B", "transpose+contiguous only, no matmul",
+            lambda: mx.contiguous(left.transpose(0, 3, 1, 2)), base=t_as)
+        del lt, rt, ltc, rtc
+
+        # ---- C. the gating chain ---------------------------------------
+        bundled = mx.random.normal((1, L, L, 4 * D)).astype(dt)
+        mx.eval(bundled)
+        moved_gate = (bundled.nbytes + bundled.nbytes // 2)
+
+        def as_written():
+            sig, gl = mx.split(bundled, 2, axis=-1)
+            r = sig * mx.sigmoid(gl)
+            return r * m[..., None]
+
+        halves = mx.contiguous(bundled[..., : 2 * D]), \
+            mx.contiguous(bundled[..., 2 * D:])
+        mx.eval(halves)
+
+        print("\n-- C. the gating: does mx.split's stride cost anything?")
+        print(hdr)
+        print("  " + "-" * (len(hdr) - 2))
+        t_g = row("C", "split + sigmoid + mul + mask (as written)",
+                  as_written, moved=moved_gate)
+        row("C", "contiguous halves, same arithmetic",
+            lambda: (halves[0] * mx.sigmoid(halves[1])) * m[..., None],
+            moved=moved_gate, base=t_g)
+        cg = mx.compile(as_written)
+        row("C", "as written, inside mx.compile", lambda: cg(),
+            moved=moved_gate, base=t_g)
+        row("C", "floor: read bundled, write one half",
+            lambda: bundled[..., : 2 * D] + bundled[..., 2 * D:],
+            moved=moved_gate, base=t_g)
+        del bundled, halves
+
+        # ---- D. the epilogue -------------------------------------------
+        mixed = mx.random.normal((1, L, L, D)).astype(dt)
+        gate = mx.random.normal((1, L, L, D)).astype(dt)
+        pair = mx.random.normal((1, L, L, D)).astype(dt)
+        mx.eval(mixed, gate, pair)
+        moved_ep = 4 * mixed.nbytes
+
+        print("\n-- D. the epilogue: mixed * sigmoid(gate), then residual")
+        print(hdr)
+        print("  " + "-" * (len(hdr) - 2))
+        t_e = row("D", "two steps, as the model does",
+                  lambda: pair + (mixed * mx.sigmoid(gate)),
+                  moved=moved_ep)
+        ce = mx.compile(lambda a, b, c_: a + (b * mx.sigmoid(c_)))
+        row("D", "same, inside mx.compile", lambda: ce(pair, mixed, gate),
+            moved=moved_ep, base=t_e)
+        row("D", "floor: 3 reads, 1 write", lambda: pair + mixed + gate,
+            moved=moved_ep, base=t_e)
+
+        del tm, z, m, left, right, mixed, gate, pair
+        mx.clear_cache()
+
+    print("\n" + "=" * 78)
+    print("How to read this:")
+    print("  B: if 'pre-transposed' is much faster than 'as written', the")
+    print("     transposes materialise and are worth attacking. If equal,")
+    print("     MLX folds them in and that part of the estimate is wrong.")
+    print("  C: if 'contiguous halves' beats 'as written', mx.split's stride")
+    print("     is costing us. The floor row moves the same bytes with")
+    print("     trivial arithmetic, so it is what a fused kernel could reach.")
+    print("  C/D: whatever 'inside mx.compile' already wins is NOT available")
+    print("     to a custom kernel -- the trunk is already compiled.")
+    if args.json:
+        save_json(args.json, out)
+        print(f"\nwrote {args.json}")
+
+
 def cmd_ceilings(args):
     c = measure_ceilings(dtype=args.mx_dtype, gemm_n=args.gemm_n)
     print(render_ceilings(c))
@@ -674,6 +830,12 @@ def main():
     mi.add_argument("--iters", type=int, default=20)
     mi.add_argument("--ln-widths", type=int, nargs="+",
                     default=[256, 512, 1024])
+
+    tm = sub.add_parser("trimul", parents=[common])
+    tm.add_argument("--seq-len", type=int, nargs="+", default=[500])
+    tm.add_argument("--c-z", type=int, default=256)
+    tm.add_argument("--iters", type=int, default=10)
+    tm.set_defaults(fn=cmd_trimul)
     mi.set_defaults(fn=cmd_micro)
 
     args = p.parse_args()
