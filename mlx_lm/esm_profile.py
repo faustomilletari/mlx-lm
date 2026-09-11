@@ -41,6 +41,7 @@ from .esm_profiler import (
     render_scaling,
     render_dtype_mix,
     render_memory,
+    render_portability,
     render_shapes,
     render_sweep,
     render_verdict,
@@ -370,6 +371,10 @@ def _report(rows, per_class, per_layer, args, ceilings, extra=None):
     print()
     print(render_verdict(rows, per_class, args.seq_len, ceilings,
                          top=args.verdict_top))
+    if args.target:
+        print()
+        print(render_portability(per_class, args.seq_len, ceilings,
+                                 args.target, top=args.top))
     if args.json:
         payload = {"ceilings": ceilings.as_dict(), "memory": memory_info(),
                    "rows": rows, "per_class": per_class, "per_layer": per_layer,
@@ -625,6 +630,10 @@ def main():
     common.add_argument("--weights", action="store_true",
                         help="load the real checkpoint instead of random init")
     common.add_argument("--chains", type=int, default=1)
+    common.add_argument("--target", action="append", nargs=3,
+                        metavar=("NAME", "GBPS", "TFLOPS"), default=None,
+                        help="a chip to test portability against, e.g. "
+                             "--target M5-Ultra 1200 80. Repeatable.")
     common.add_argument("--shapes", action="store_true",
                         help="print real input shapes and ms/call for the "
                              "slowest layers at the longest length")
@@ -669,6 +678,8 @@ def main():
 
     args = p.parse_args()
     args.mx_dtype = DTYPES[args.dtype]
+    if args.target:
+        args.target = [(n, float(bw), float(tf)) for n, bw, tf in args.target]
     args.seq_len = sorted(set(args.seq_len))
     t0 = time.perf_counter()
     args.fn(args)
