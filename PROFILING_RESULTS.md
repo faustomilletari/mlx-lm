@@ -84,12 +84,50 @@ With ESMC, `steps=14`:
 
 Fits: total L^1.70, `lm` L^0.86, **trunk L^2.05**, sampler L^0.62.
 
-With `--skip-lm`: L=256 trunk 6.176s, L=384 14.319s, L=500 25.132s. Fits
-trunk L^2.09, sampler L^1.33.
+With `--skip-lm`, four lengths, the reference fp32 sweep. **Pin this by SHA:
+`8a8efde`.** `main` no longer reproduces it, since the bf16 PRs landed.
+
+| L | trunk | sampler | total | peak |
+|---|---|---|---|---|
+| 128 | 1.495s | 0.224s | 1.718s | 2.36 GB |
+| 256 | 6.219s | 0.448s | 6.667s | 2.96 GB |
+| 384 | 14.470s | 0.756s | 15.226s | 4.87 GB |
+| 500 | 26.062s | 1.113s | 27.175s | 7.71 GB |
+
+Fits: total L^2.02, **trunk L^2.09**, sampler L^1.17.
 
 **The trunk scales L^2, not L^3. The O(L^3) contraction is not the limiter.**
 
-No stage-2 sweep yet. That is the next measurement.
+### Per-class exponents, fp32, from the same sweep
+
+| Class | L=500 | share | L^k |
+|---|---|---|---|
+| `Linear` | 16.492s | 53.3% | **1.69** |
+| `TriangleMultiplicativeUpdate` | 8.351s | 27.0% | **2.08** |
+| `SwiGLUMLP` | 2.184s | 7.1% | 1.89 |
+| `LayerNorm` | 1.882s | 6.1% | 1.70 |
+| `PairUpdateBlock` | 0.984s | 3.2% | 1.61 |
+| `SWA3DRoPEAttention` | 0.453s | 1.5% | 1.52 |
+
+`Linear` below L^2 despite M = L^2 work: GEMM efficiency rises with M, so
+short lengths are less efficient. At L=128, M=16384 and `w12` tiles poorly.
+
+`TriMul` is the fastest-growing significant class. Extrapolating to L=1000 its
+share goes 27% -> ~32% while `Linear` falls 53% -> ~48%. **Fusing TriMul gets
+more valuable at longer chains and on a bigger chip, not less.**
+
+No stage-2 sweep yet.
+
+## Run-to-run variance
+
+The same fp32 config at L=500 measured 25.013s, 25.132s and 26.062s across
+three sessions: a spread of ~4%. The ceiling probe varies similarly, 174-214
+GB/s.
+
+**Consequence: a claimed gain under ~5% is inside noise.** Stage 2's 1.054x
+sits right at that boundary. Quote the conservative baseline, or repeat the
+run, before trusting a small delta. Stage 1 at 1.18x is comfortably outside
+it.
 
 ## Microbenchmarks at L=500
 
