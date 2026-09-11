@@ -223,6 +223,79 @@ bf16 matmul accumulates in fp32: relative error flat at 0.00141 for K = 64,
 256, 500, 1024, 4096. A bf16 accumulator would grow as sqrt(K) and reach ~4%
 at the production K=500.
 
+## TriMul phase 1, L=500, c_z=256, bf16
+
+Ceilings that run: 195.9 GB/s, 6.02 TFLOP/s.
+
+### A. Attribution ground truth -- it checks out
+
+| variant | ms |
+|---|---|
+| `TriangleMultiplicativeUpdate(z, mask)` | 65.08 |
+| same inside `mx.compile` | 59.79 (0.92x) |
+
+The profiler's *exclusive* number is 5.859s / 204 = 28.7ms, which excludes
+children. Adding the children back: `proj_bundle` 22.1 + `proj_emit` 6.1 +
+`proj_gate` 6.1 + two norms 2.7 + own body 28.7 = **65.7ms predicted against
+65.08ms measured**. The attribution chain is sound.
+
+### B. The contraction -- the input transposes are real
+
+| variant | ms | TFLOP/s | vs as-written |
+|---|---|---|---|
+| `_contract` as written (3 transposes) | 17.57 | 3.64 | — |
+| pre-transposed in, transpose out | **11.87** | **5.39** | 0.68x |
+| pre-transposed in, no transpose out | 11.87 | 5.39 | 0.68x |
+| `mx.einsum bikd,bjkd->bijd` | 17.57 | 3.64 | 1.00x |
+| transpose+contiguous only, no matmul | 2.33 | — | 0.13x |
+
+- The **input** transposes cost 17.57 - 11.87 = **5.70ms per call**, which is
+  ~2x the 2.33ms standalone copy. They materialise.
+- The **output** transpose is free: identical with and without.
+- `mx.einsum` lowers to the same path. No free win there.
+- The matmul itself reaches 5.39 of 6.02 TFLOP/s, **90% of roof**. Irreducible.
+
+Input transposes across the trunk: 5.70ms x 204 = **1.16s, 5.8% of 20.05s**.
+
+### C. The gating -- mx.compile already did it
+
+| variant | ms | GB/s | vs as-written |
+|---|---|---|---|
+| split + sigmoid + mul + mask | 7.93 | 96.9 | — |
+| contiguous halves, same maths | 8.62 | 89.1 | **1.09x, slower** |
+| **inside `mx.compile`** | **3.62** | **212.3** | **0.46x** |
+| floor: read bundled, write one half | 3.53 | 217.6 | 0.45x |
+
+`mx.compile` reaches **97% of the floor**. `mx.split`'s stride costs nothing;
+forcing contiguity is *worse*. **A fused kernel here would buy ~0.09ms per
+call. Nothing.**
+
+### D. The epilogue -- also already done
+
+| variant | ms | GB/s |
+|---|---|---|
+| two steps, as the model does | 4.36 | 117.3 |
+| **inside `mx.compile`** | **2.31** | **221.4** |
+| floor: 3 reads 1 write | 3.35 | 152.9 |
+
+Compiled beats my floor row, which was not compiled and so made two passes.
+At 221 GB/s it is above the measured streaming ceiling, so it is cache-assisted
+and already optimal. **Nothing to win.**
+
+### Verdict
+
+The trunk runs inside a compiled `FoldingTrunk`, so C and D are already fused
+in production. **Phase 3 as proposed is dead.** The only non-arithmetic cost
+left in TriMul is the input transposes: 1.16s, 5.8% here.
+
+Removing them needs a GEMM that writes transposed output, which is what the
+reference's `fused_gated_dual_gemm_split` plus `(D,B,L,L)`-native
+`trimul_einsum_triton` do. That is a kernel, for 5.8% on this chip.
+
+On an M5 Ultra the transposes are memory-bound while the GEMMs are
+compute-bound, so their share roughly doubles to **~11%**. The case is better
+on the target than on the proxy.
+
 ## Harness bugs that invalidated earlier numbers
 
 Read this before comparing against anything older than the commit named.
