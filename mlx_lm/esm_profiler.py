@@ -113,9 +113,22 @@ class Ceilings:
     peak_gemm_tflops: float
     detail: dict = field(default_factory=dict)
 
+    @property
+    def ridge(self) -> float:
+        """FLOP per byte at which compute and memory take equally long.
+
+        Hardware-independent way to read a layer: intensity above the ridge is
+        compute-bound, below it is memory-bound. Because the ridge differs per
+        chip, the same layer can be compute-bound on one and memory-bound on
+        another -- which is why a percentage measured on one machine does not
+        transfer to another.
+        """
+        return (self.peak_gemm_tflops * 1e12) / (self.peak_bw_gbs * 1e9)
+
     def as_dict(self) -> dict:
         return {"device": self.device, "peak_bw_gbs": self.peak_bw_gbs,
-                "peak_gemm_tflops": self.peak_gemm_tflops, "detail": self.detail}
+                "peak_gemm_tflops": self.peak_gemm_tflops,
+                "ridge_flop_per_byte": self.ridge, "detail": self.detail}
 
 
 def _time_op(fn: Callable[[], Any], iters: int = 20, warmup: int = 5) -> float:
@@ -204,6 +217,12 @@ class ModuleStat:
         if self.excl_s <= 0 or self.is_container:
             return None
         return self.moved_bytes / self.excl_s / 1e9
+
+    def intensity(self) -> Optional[float]:
+        """FLOP per byte. Only meaningful where FLOPs are counted exactly."""
+        if self.flops <= 0 or self.moved_bytes <= 0:
+            return None
+        return self.flops / self.moved_bytes
 
     def tflops(self) -> Optional[float]:
         """Achieved compute rate. None when we cannot count FLOPs exactly.
@@ -513,8 +532,9 @@ def render_ceilings(c: Ceilings) -> str:
             f"  streaming bandwidth       : {c.peak_bw_gbs:8.1f} GB/s\n"
             f"  bf16 GEMM throughput      : {c.peak_gemm_tflops:8.2f} TFLOPS\n"
             f"  bytes per flop at ceiling : "
-            f"{c.peak_bw_gbs/1e3/c.peak_gemm_tflops:8.4f}"
-            f"   <- a layer below this ratio is compute-bound")
+            f"{c.peak_bw_gbs/1e3/c.peak_gemm_tflops:8.4f}\n"
+            f"  ridge point               : {c.ridge:8.1f} FLOP/byte"
+            f"   <- above this a layer is compute-bound")
 
 
 def render_modes(eval_wall: float, lazy_wall: float) -> str:
@@ -827,4 +847,65 @@ def render_dtype_mix(dtype_bytes: dict, title: str = "traffic by dtype") -> str:
                    "bandwidth-bound op is paying 2x.")
         out.append("     Find the first fp32 tensor and cast it; promotion "
                    "spreads downstream.")
+    return "\n".join(out)
+
+
+def render_portability(per_class: dict, lengths: list[int], here: Ceilings,
+                       targets: list[tuple[str, float, float]],
+                       top: int = 10) -> str:
+    """Would this layer still be the bottleneck on a different chip?
+
+    A percentage measured on one machine does not transfer to another. What
+    does transfer is arithmetic intensity: FLOP per byte is a property of the
+    computation, not the hardware. Compare it against each chip's ridge point
+    and the binding constraint falls out.
+
+    Only rows with exactly-counted FLOPs can be placed. Memory-bound rows with
+    no FLOP count (the norms, the elementwise epilogues) stay memory-bound on
+    every chip listed here, since every ridge point is far above 1 FLOP/byte.
+    """
+    Lmax = max(lengths)
+    rank = sorted(per_class.items(),
+                  key=lambda kv: kv[1].get(Lmax, {}).get("excl_s", 0.0),
+                  reverse=True)
+    total = sum(v.get(Lmax, {}).get("excl_s", 0.0) for _, v in rank) or 1.0
+    chips = [(f"{here.device} (measured)", here.peak_bw_gbs,
+              here.peak_gemm_tflops)] + list(targets)
+
+    out = ["== does this transfer to another chip?",
+           "  Arithmetic intensity is a property of the maths, not the "
+           "machine. Compare",
+           "  it to each chip's ridge point to see what binds there.", ""]
+    out.append("  ridge points (FLOP/byte):")
+    for name, bw, tf in chips:
+        out.append(f"    {name:<28}{(tf*1e12)/(bw*1e9):8.1f}")
+    out.append("")
+    head = f"  {'class':<26}{'%here':>7}{'FLOP/byte':>11}" + \
+           "".join(f"{n.split()[0][:11]:>13}" for n, _, _ in chips)
+    out += [head, "  " + "-" * (len(head) - 2)]
+    for cls, byL in rank[:top]:
+        at = byL.get(Lmax)
+        if not at or at["excl_s"] <= 0:
+            continue
+        flops, mb = at.get("flops", 0.0), at.get("moved_bytes", 0)
+        share = 100 * at["excl_s"] / total
+        if at.get("gbs") is None:
+            # Container: its children did the work, so it has no rate of its
+            # own and cannot be placed on either side of a ridge.
+            line = (f"  {cls[:25]:<26}{share:>7.1f}{'-':>11}"
+                    + "".join(f"{'n/a':>13}" for _ in chips))
+        elif flops <= 0 or mb <= 0:
+            line = (f"  {cls[:25]:<26}{share:>7.1f}{'-':>11}"
+                    + "".join(f"{'memory':>13}" for _ in chips))
+        else:
+            ai = flops / mb
+            line = f"  {cls[:25]:<26}{share:>7.1f}{ai:>11.1f}"
+            for _, bw, tf in chips:
+                line += f"{('compute' if ai >= (tf*1e12)/(bw*1e9) else 'memory'):>13}"
+        out.append(line)
+    out.append("")
+    out.append("  A row that flips to 'memory' on the target is one where a "
+               "fusion that looks\n  marginal here pays more there. A row that "
+               "stays 'compute' gains from a\n  faster GEMM, which the target "
+               "already provides for free.")
     return "\n".join(out)
