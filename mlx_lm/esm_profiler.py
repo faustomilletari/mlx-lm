@@ -337,8 +337,26 @@ class LayerProfiler:
         st = self.stats[path]
         sync = self.mode == "eval"
         if sync:
-            # Flush the parent's own pending ops so their cost is charged to
-            # the parent, not to this child.
+            # Flush the parent's pending ops so their cost lands on the parent
+            # and not on this child.
+            #
+            # mx.synchronize() alone does NOT do this. MLX graphs are lazy, and
+            # synchronize only waits on work already submitted to the stream;
+            # un-evaluated nodes stay pending. The inputs must be mx.eval'd.
+            #
+            # Getting this wrong cost real time. Every module was absorbing its
+            # parent's unevaluated upstream ops, so the residual adds, the
+            # gating, the astypes and the SwiGLU epilogue were all charged to
+            # whichever leaf happened to consume them. LayerNorm read as 32% of
+            # the trunk while an isolated norm of the same shape and dtype sat
+            # at the bandwidth roof.
+            #
+            # This runs before the timer starts, so the flushed work is billed
+            # to the enclosing module's exclusive time, which is where it
+            # belongs.
+            pending = list(iter_arrays(args)) + list(iter_arrays(kwargs))
+            if pending:
+                mx.eval(pending)
             mx.synchronize()
         in_bytes = tensor_bytes(args) + tensor_bytes(kwargs)
         if self.record_shapes and len(st.shapes) < 4:
