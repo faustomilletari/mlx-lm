@@ -514,6 +514,60 @@ Trunk 18.965s at L=500, and every component is at a roof:
 `Linear` at 179.9 FLOP/byte and TriMul at 760.5 stay **compute-bound on an M5
 Ultra**, so 83% of the trunk takes the full M5 compute uplift for free.
 
+## Final end-to-end result, 100 to 1000 residues
+
+`esm_profile fold`, all three optimisations merged, `loops=3`, `steps=14`,
+random weights, 48 GB M4 Pro.
+
+| L | atoms | ESMC | trunk | sampler | FOLD | TOTAL | ESMC % |
+|---|---|---|---|---|---|---|---|
+| 100 | 800 | 0.32s | 0.72s | 0.21s | 0.93s | **1.25s** | 26% |
+| 200 | 1600 | 0.60s | 2.90s | 0.36s | 3.26s | **3.86s** | 16% |
+| 300 | 2400 | 0.77s | 6.53s | 0.57s | 7.10s | **7.87s** | 10% |
+| 500 | 4000 | 1.20s | 18.95s | 1.16s | 20.11s | **21.31s** | 6% |
+| 750 | 6000 | 1.81s | 45.45s | 2.18s | 47.63s | **49.44s** | 4% |
+| 1000 | 8000 | 2.45s | 84.83s | 3.47s | 88.29s | **90.74s** | 3% |
+
+Scaling: ESMC L^0.86, trunk **L^2.07**, sampler L^1.23, total L^1.87.
+
+| L | ESMC w | fold w | ESMC act | fold act | ESMC peak | fold peak | PEAK |
+|---|---|---|---|---|---|---|---|
+| 100 | 11.83 | 0.35 | 0.31 | 1.05 | 12.49 | 13.24 | 13.24 |
+| 200 | 11.83 | 0.35 | 0.53 | 1.30 | 12.71 | 13.48 | 13.48 |
+| 300 | 11.83 | 0.35 | 0.71 | 1.84 | 12.89 | 14.02 | 14.02 |
+| 500 | 11.83 | 0.35 | 1.15 | 4.08 | 13.33 | 16.27 | 16.27 |
+| 750 | 11.83 | 0.35 | 1.72 | 8.97 | 13.91 | 21.15 | 21.15 |
+| 1000 | 11.83 | 0.35 | 2.30 | 15.78 | 14.48 | 27.96 | **27.96** |
+
+**A 1000-residue fold runs in 90.7s and fits in 28 GB of a 37.44 GB working
+set.** Peak memory's L^0.31 fit is an artefact of the constant 12.18 GB of
+weights; activations alone go L^0.31 from 100 to 200 (a fixed-buffer floor)
+and **L^1.95 from 500 to 1000**, which is the real behaviour.
+
+### ESMC is a memory problem, not a time problem
+
+| | ESMC | ESMFold2 |
+|---|---|---|
+| weights | **11.83 GB (97% of resident)** | 0.35 GB |
+| time at L=1000 | **2.45s (3% of the fold)** | 88.29s |
+
+Exactly inverted: ESMC is 34x the weights and 36x less time. Its share of the
+fold falls from **26% at L=100 to 3% at L=1000**, so it only matters for short
+chains.
+
+### The memory wall, and how to move it
+
+Weights are 12.18 GB fixed; activations are 15.78 GB at L=1000 and grow as
+L^2. The recommended working set is exhausted at **L ~ 1265**.
+
+Quantising ESMC to 4 bits (11.83 -> ~3.3 GB) frees 8.5 GB and moves the wall
+to **L ~ 1465, a 16% longer chain**. It would also speed up short folds, where
+ESMC is 26% of the time and weight-bandwidth-bound. It does nothing for long
+folds. That is the one optimisation left with a clear, quantified payoff.
+
+For the record, at `steps=50` instead of 14: L=100 1.8s, L=500 24.3s,
+L=1000 99.7s.
+
 ## Harness bugs that invalidated earlier numbers
 
 Read this before comparing against anything older than the commit named.
