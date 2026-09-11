@@ -73,6 +73,17 @@ def _all_param_bytes(m: nn.Module) -> int:
                if isinstance(v, mx.array))
 
 
+def _linear_shape(m: nn.Module) -> tuple:
+    """(in_features, out_features) for a plain Linear, else ()."""
+    w = m.get("weight") if hasattr(m, "get") else None
+    if not isinstance(w, mx.array) or w.ndim != 2:
+        return ()
+    if type(m).__name__ not in ("Linear", "QuantizedLinear"):
+        return ()
+    out_f, in_f = w.shape
+    return (in_f, out_f)
+
+
 def own_param_bytes(m: nn.Module) -> int:
     """Parameter bytes belonging to this module and not to a descendant."""
     total = _all_param_bytes(m)
@@ -159,6 +170,8 @@ class ModuleStat:
     own_params: int = 0     # static size of this module's own weights
     param_bytes: int = 0    # own_params accumulated over calls
     alloc_delta: int = 0
+    flops: float = 0.0      # exact, counted only where we can (Linear)
+    gemm_shape: tuple = ()  # (in_features, out_features) for Linear
     shapes: list = field(default_factory=list)
 
     @property
@@ -182,11 +195,24 @@ class ModuleStat:
             return None
         return self.moved_bytes / self.excl_s / 1e9
 
+    def tflops(self) -> Optional[float]:
+        """Achieved compute rate. None when we cannot count FLOPs exactly.
+
+        Counting FLOPs generically is not possible from a module hook, so we
+        only count them where the shape makes it unambiguous. A GEMM near the
+        compute ceiling has no headroom no matter what its GB/s says, which is
+        the distinction that decides whether a layer is worth touching.
+        """
+        if self.excl_s <= 0 or self.flops <= 0 or self.is_container:
+            return None
+        return self.flops / self.excl_s / 1e12
+
     def as_dict(self) -> dict:
         return {"path": self.path, "cls": self.cls, "calls": self.calls,
                 "incl_s": self.incl_s, "excl_s": self.excl_s,
                 "in_bytes": self.in_bytes, "out_bytes": self.out_bytes,
                 "own_params": self.own_params, "param_bytes": self.param_bytes,
+                "flops": self.flops, "tflops": self.tflops(),
                 "alloc_delta": self.alloc_delta,
                 "moved_bytes": self.moved_bytes, "gbs": self.gbs(),
                 "shapes": self.shapes[:4]}
@@ -233,7 +259,8 @@ class LayerProfiler:
             self._registry[id(mod)] = path
             self.stats[path] = ModuleStat(
                 path=path, cls=type(mod).__name__,
-                own_params=own_param_bytes(mod))
+                own_params=own_param_bytes(mod),
+                gemm_shape=_linear_shape(mod))
             for klass in type(mod).__mro__:
                 if "__call__" in klass.__dict__ and klass is not nn.Module:
                     classes[klass] = None
@@ -307,6 +334,10 @@ class LayerProfiler:
         st.in_bytes += in_bytes
         st.out_bytes += tensor_bytes(out)
         st.param_bytes += st.own_params
+        if st.gemm_shape:
+            in_f, out_f = st.gemm_shape
+            rows = sum(a.size for a in iter_arrays(args)) // max(in_f, 1)
+            st.flops += 2.0 * rows * in_f * out_f
         st.alloc_delta += mx.get_active_memory() - alloc0
         if self._stack:
             self._stack[-1][2] += incl
@@ -328,6 +359,7 @@ class LayerProfiler:
             a.out_bytes += st.out_bytes
             a.own_params += st.own_params
             a.param_bytes += st.param_bytes
+            a.flops += st.flops
             a.alloc_delta += st.alloc_delta
         return agg
 
@@ -397,34 +429,53 @@ def _elide(path: str, width: int) -> str:
     return cand[-width:]
 
 
+def _limiter(gbs, tflops, c: Optional[Ceilings]):
+    """(verdict, bw_fraction, flop_fraction). Names the binding ceiling.
+
+    A layer is only worth touching if it is far from BOTH ceilings. Near
+    either one, the work is already done and a rewrite buys nothing.
+    """
+    if c is None:
+        return "", None, None
+    bw = gbs / c.peak_bw_gbs if gbs else None
+    fl = tflops / c.peak_gemm_tflops if tflops else None
+    best = max([x for x in (bw, fl) if x is not None], default=None)
+    if best is None:
+        return "container", bw, fl
+    which = "GEMM" if (fl is not None and fl == best) else "BW"
+    if best >= 0.6:
+        return f"at {which} roof", bw, fl
+    if best >= 0.25:
+        return f"part {which}", bw, fl
+    return "HEADROOM", bw, fl
+
+
+def _pct(x):
+    return f"{100*x:.0f}" if x is not None else "-"
+
+
 def render(stats: list[ModuleStat], ceilings: Optional[Ceilings] = None,
            total_s: Optional[float] = None, top: int = 25,
            title: str = "per-layer", label: str = "layer") -> str:
     rows = sorted(stats, key=lambda s: s.excl_s, reverse=True)
     total = total_s if total_s is not None else sum(s.excl_s for s in rows)
-    peak = ceilings.peak_bw_gbs if ceilings else None
 
-    w = 44
+    w = 40
     head = (f"{label:<{w}}{'calls':>7}{'excl s':>9}{'%':>6}"
-            f"{'incl s':>9}{'traffic':>10}{'GB/s':>9}")
-    if peak:
-        head += f"{'%BW':>7}{'verdict':>14}"
+            f"{'GB/s':>8}{'%BW':>5}{'TFLOP/s':>9}{'%GEMM':>7}")
+    if ceilings:
+        head += f"{'limiter':>15}"
     out = [f"== {title}", head, "-" * len(head)]
     for s in rows[:top]:
-        name = _elide(s.path, w - 1)
+        g, t = s.gbs(), s.tflops()
+        v, bw, fl = _limiter(g, t, ceilings)
         pct = 100 * s.excl_s / total if total else 0.0
-        g = s.gbs()
-        line = (f"{name:<{w}}{s.calls:>7}{s.excl_s:>9.3f}{pct:>6.1f}"
-                f"{s.incl_s:>9.3f}{_fmt_bytes(s.moved_bytes):>10}"
-                f"{(f'{g:.1f}' if g is not None else '-'):>9}")
-        if peak:
-            if g is None:
-                line += f"{'-':>7}{'container':>14}"
-            else:
-                frac = g / peak
-                v = ("BW-BOUND" if frac >= 0.6 else
-                     "part BW" if frac >= 0.25 else "not BW")
-                line += f"{100*frac:>7.0f}{v:>14}"
+        line = (f"{_elide(s.path, w-1):<{w}}{s.calls:>7}{s.excl_s:>9.3f}"
+                f"{pct:>6.1f}"
+                f"{(f'{g:.1f}' if g else '-'):>8}{_pct(bw):>5}"
+                f"{(f'{t:.2f}' if t else '-'):>9}{_pct(fl):>7}")
+        if ceilings:
+            line += f"{v:>15}"
         out.append(line)
     shown = sum(s.excl_s for s in rows[:top])
     out.append(f"{'':<{w}}{'':>7}{shown:>9.3f}"
@@ -530,13 +581,12 @@ def render_scaling(per_class: dict, lengths: list[int],
                   key=lambda kv: kv[1].get(Lmax, {}).get("excl_s", 0.0),
                   reverse=True)
     total = sum(v.get(Lmax, {}).get("excl_s", 0.0) for _, v in rank) or 1.0
-    peak = ceilings.peak_bw_gbs if ceilings else None
 
-    w = 34
-    head = (f"{label:<{w}}{'calls':>7}{f'L={Lmax} s':>12}{'%':>6}"
-            f"{'L^k':>7}{'GB/s':>9}")
-    if peak:
-        head += f"{'%BW':>6}{'verdict':>13}"
+    w = 32
+    head = (f"{label:<{w}}{'calls':>7}{f'L={Lmax} s':>11}{'%':>6}{'L^k':>7}"
+            f"{'GB/s':>8}{'%BW':>5}{'TFLOP/s':>9}{'%GEMM':>7}")
+    if ceilings:
+        head += f"{'limiter':>15}"
     out = [f"== {title}  (ranked at L={Lmax})", head, "-" * len(head)]
     for cls, byL in rank[:top]:
         at = byL.get(Lmax)
@@ -544,19 +594,15 @@ def render_scaling(per_class: dict, lengths: list[int],
             continue
         k = fit_exponent(lengths,
                          [byL.get(L, {}).get("excl_s", 0.0) for L in lengths])
-        gbs = at.get("gbs")
-        line = (f"{_elide(cls, w-1):<{w}}{at['calls']:>7}{at['excl_s']:>12.3f}"
+        g, t = at.get("gbs"), at.get("tflops")
+        v, bw, fl = _limiter(g, t, ceilings)
+        line = (f"{_elide(cls, w-1):<{w}}{at['calls']:>7}{at['excl_s']:>11.3f}"
                 f"{100*at['excl_s']/total:>6.1f}"
                 f"{(f'{k:.2f}' if k is not None else '-'):>7}"
-                f"{(f'{gbs:.1f}' if gbs else '-'):>9}")
-        if peak:
-            if not gbs:
-                line += f"{'-':>6}{'container':>13}"
-            else:
-                frac = gbs / peak
-                v = ("BW-BOUND" if frac >= 0.6 else
-                     "part BW" if frac >= 0.25 else "not BW")
-                line += f"{100*frac:>6.0f}{v:>13}"
+                f"{(f'{g:.1f}' if g else '-'):>8}{_pct(bw):>5}"
+                f"{(f'{t:.2f}' if t else '-'):>9}{_pct(fl):>7}")
+        if ceilings:
+            line += f"{v:>15}"
         out.append(line)
     return "\n".join(out)
 
@@ -573,14 +619,14 @@ def render_verdict(rows: list[dict], per_class: dict, lengths: list[int],
 
     out = [f"== where the time goes at L={Lmax}"]
     if lazy >= 0.40:
-        out.append(f"  Dispatch-bound: {100*lazy:.0f}% of the time is Python and "
-                   "graph build.\n  Cut op count or mx.compile. Kernels will not help.")
+        out.append(f"  Dispatch-bound: {100*lazy:.0f}% is Python and graph "
+                   "build. Cut op count. Kernels will not help.")
     elif lazy >= 0.15:
-        out.append(f"  {100*lazy:.0f}% is Python and graph build. Real, but not "
-                   "the main cost.")
+        out.append(f"  {100*lazy:.0f}% is Python and graph build. Real, but "
+                   "not the main cost.")
     else:
-        out.append(f"  Device-bound: only {100*lazy:.0f}% is Python and graph "
-                   "build. Optimise the kernels.")
+        out.append(f"  Device-bound: only {100*lazy:.1f}% is Python and graph "
+                   "build. The time is in kernels.")
     out.append("")
     for cls, byL in rank[:top]:
         at = byL.get(Lmax)
@@ -588,22 +634,30 @@ def render_verdict(rows: list[dict], per_class: dict, lengths: list[int],
             continue
         k = fit_exponent(lengths,
                          [byL.get(L, {}).get("excl_s", 0.0) for L in lengths])
-        gbs = at.get("gbs")
-        grow = (f", grows as L^{k:.1f}" if k is not None else "")
-        if not gbs:
-            out.append(f"  {100*at['excl_s']/total:5.1f}%  {cls:<28} "
-                       f"  (container){grow}")
-            out.append("         -> time is in its children, not in itself")
+        grow = (f", L^{k:.1f}" if k is not None else "")
+        g, t = at.get("gbs"), at.get("tflops")
+        v, bw, fl = _limiter(g, t, ceilings)
+        share = 100 * at["excl_s"] / total
+        if v == "container":
+            out.append(f"  {share:5.1f}%  {cls:<30} container{grow}")
+            out.append("           -> cost is in its children")
             continue
-        frac = gbs / ceilings.peak_bw_gbs
-        why = ("saturating bandwidth; fuse to cut round trips"
-               if frac >= 0.6 else
-               "not bandwidth-limited; check a gputrace for the real limiter"
-               if frac < 0.25 else "partly bandwidth-limited")
-        out.append(f"  {100*at['excl_s']/total:5.1f}%  {cls:<28} "
-                   f"{gbs:6.1f} GB/s ({100*frac:.0f}% of peak){grow}")
-        out.append(f"         -> {why}")
+        rate = []
+        if g:
+            rate.append(f"{g:.0f} GB/s = {100*bw:.0f}% of BW")
+        if t:
+            rate.append(f"{t:.2f} TFLOP/s = {100*fl:.0f}% of GEMM")
+        out.append(f"  {share:5.1f}%  {cls:<30} {', '.join(rate)}{grow}")
+        if v == "HEADROOM":
+            out.append("           -> FAR from both ceilings. Real headroom "
+                       "here; this is where to look.")
+        elif v.startswith("at "):
+            out.append(f"           -> already {v}. Nothing to win without "
+                       "changing the maths.")
+        else:
+            out.append(f"           -> {v}; partial headroom.")
     return "\n".join(out)
+
 
 
 # ---------------------------------------------------------------------------

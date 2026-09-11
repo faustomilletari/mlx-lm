@@ -276,11 +276,12 @@ def sweep(model, make_phases, args, ceilings):
                     key = st.cls if store is per_class else st.path
                     d = store.setdefault(key, {}).setdefault(
                         L, {"calls": 0, "excl_s": 0.0, "incl_s": 0.0,
-                            "moved_bytes": 0})
+                            "moved_bytes": 0, "flops": 0.0})
                     d["calls"] += st.calls
                     d["excl_s"] += st.excl_s
                     d["incl_s"] += st.incl_s
                     d["moved_bytes"] += st.moved_bytes
+                    d["flops"] += st.flops
 
             if detail == "full":
                 print(f"\n{'#'*78}\n# L={L}  {label}   "
@@ -314,12 +315,14 @@ def sweep(model, make_phases, args, ceilings):
 
 
 def _finalize(store):
-    """Fill in achieved GB/s, suppressed where children did the work."""
+    """Fill in achieved rates, suppressed where children did the work."""
     for byL in store.values():
         for d in byL.values():
             container = d["incl_s"] > 0 and (d["excl_s"] / d["incl_s"]) < 0.5
-            d["gbs"] = (None if container or d["excl_s"] <= 0
-                        else d["moved_bytes"] / d["excl_s"] / 1e9)
+            dead = container or d["excl_s"] <= 0
+            d["gbs"] = None if dead else d["moved_bytes"] / d["excl_s"] / 1e9
+            d["tflops"] = (None if dead or d["flops"] <= 0
+                           else d["flops"] / d["excl_s"] / 1e12)
 
 
 def render_compile(rows, phases) -> str:
@@ -415,6 +418,86 @@ def _maybe_trace(args, model, make_phases):
           else "\nno Metal device; no trace written")
 
 
+def cmd_micro(args):
+    """Isolate the pair-stack primitives at their real shapes.
+
+    The sweep says where time goes; this says whether the op itself is slow.
+    Everything here runs on a (1, L, L, D) pair tensor, which is the shape
+    that dominates the trunk.
+    """
+    import mlx.nn as nn
+
+    from .esm_profiler import _time_op
+
+    c = measure_ceilings(dtype=args.mx_dtype, gemm_n=args.gemm_n)
+    print(render_ceilings(c))
+    D, dt = args.c_z, args.mx_dtype
+    out = {"ceilings": c.as_dict(), "cases": []}
+
+    for L in args.seq_len:
+        M = L * L
+        z = mx.random.normal((1, L, L, D)).astype(dt)
+        z2 = mx.random.normal((M, D)).astype(dt)
+        g = mx.ones((D,)).astype(dt)
+        b = mx.zeros((D,)).astype(dt)
+        ln = nn.LayerNorm(D, eps=1e-5)
+        ln.set_dtype(dt)
+        mx.eval(z, z2, g, b, ln.parameters())
+        nbytes = z.nbytes
+        print(f"\n=== L={L}  pair tensor (1,{L},{L},{D}) {dt.__str__()}  "
+              f"{nbytes/2**20:.0f} MiB")
+        hdr = f"  {'op':<40}{'ms':>9}{'GB/s':>9}{'%BW':>6}{'vs floor':>10}"
+        print(hdr)
+        print("  " + "-" * (len(hdr) - 2))
+
+        floor = None
+        rows = []
+
+        def row(name, fn, moved):
+            nonlocal floor
+            t = _time_op(fn, iters=args.iters)
+            gbs = moved / t / 1e9
+            if floor is None:
+                floor = t
+            print(f"  {name:<40}{t*1e3:>9.2f}{gbs:>9.1f}"
+                  f"{100*gbs/c.peak_bw_gbs:>6.0f}{t/floor:>9.2f}x")
+            rows.append({"L": L, "op": name, "ms": t * 1e3, "gbs": gbs})
+
+        # read once, write once: the hard floor for any normalisation
+        row("copy floor (z + 1)", lambda: z + 1, 2 * nbytes)
+        row("nn.LayerNorm (4D)", lambda: ln(z), 2 * nbytes)
+        row("mx.fast.layer_norm (4D)",
+            lambda: mx.fast.layer_norm(z, g, b, 1e-5), 2 * nbytes)
+        row("mx.fast.layer_norm (2D, reshaped)",
+            lambda: mx.fast.layer_norm(z.reshape(M, D), g, b, 1e-5),
+            2 * nbytes)
+        row("mx.fast.layer_norm (2D, native)",
+            lambda: mx.fast.layer_norm(z2, g, b, 1e-5), 2 * nbytes)
+        row("mx.fast.rms_norm (4D)",
+            lambda: mx.fast.rms_norm(z, g, 1e-5), 2 * nbytes)
+        row("manual mean/var LayerNorm", lambda: _manual_ln(z, g, b),
+            2 * nbytes)
+        row("sigmoid (elementwise ref)", lambda: mx.sigmoid(z), 2 * nbytes)
+
+        out["cases"].extend(rows)
+        del z, z2, g, b, ln
+        mx.clear_cache()
+
+    print("\n  Read it like this: any LayerNorm row far above the copy floor "
+          "is\n  a kernel problem, not an unavoidable cost. The floor is the "
+          "least\n  any op touching this tensor can possibly take.")
+    if args.json:
+        save_json(args.json, out)
+        print(f"\nwrote {args.json}")
+
+
+def _manual_ln(x, g, b, eps=1e-5):
+    f = x.astype(mx.float32)
+    mu = mx.mean(f, axis=-1, keepdims=True)
+    var = mx.var(f, axis=-1, keepdims=True)
+    return (((f - mu) * mx.rsqrt(var + eps)).astype(x.dtype)) * g + b
+
+
 def cmd_ceilings(args):
     c = measure_ceilings(dtype=args.mx_dtype, gemm_n=args.gemm_n)
     print(render_ceilings(c))
@@ -472,6 +555,12 @@ def main():
     f.add_argument("--repo", default="biohub/ESMFold2-Fast")
     f.add_argument("--config", default=None, help="local config.json")
     f.set_defaults(fn=cmd_esmfold2)
+
+    mi = sub.add_parser("micro", parents=[common])
+    mi.add_argument("--seq-len", type=int, nargs="+", default=[256, 500])
+    mi.add_argument("--c-z", type=int, default=256)
+    mi.add_argument("--iters", type=int, default=20)
+    mi.set_defaults(fn=cmd_micro)
 
     args = p.parse_args()
     args.mx_dtype = DTYPES[args.dtype]
