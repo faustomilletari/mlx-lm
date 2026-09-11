@@ -31,15 +31,19 @@ import mlx.core as mx
 
 from .esm_profiler import (
     LayerProfiler,
+    bypass_compile,
     capture,
     measure_ceilings,
+    memory_info,
     render,
     render_ceilings,
     render_modes,
     render_scaling,
+    render_memory,
     render_sweep,
     render_verdict,
     save_json,
+    time_plain,
 )
 
 FLOAT = (mx.float32, mx.float16, mx.bfloat16)
@@ -130,11 +134,17 @@ def build_esmfold2(args):
         from huggingface_hub import hf_hub_download
         cfg = json.load(open(hf_hub_download(args.repo, "config.json")))
     m = esmfold2.ESMFold2Model(cfg)
-    m._esmc = esmc.Model(
-        esmc.ModelArgs(**TINY_ESMC) if args.tiny
-        else esmc.ModelArgs(hidden_size=cfg.get("lm_d_model", 2560),
-                            num_attention_heads=args.heads,
-                            num_hidden_layers=cfg.get("lm_num_layers", 80)))
+    # ESMC is ~16 GB of bf16 weights and is dead during trunk and sampler.
+    # trunk() takes lm_hidden_states as an argument, so when the lm phase is
+    # skipped we never build it and feed a synthetic tensor instead.
+    if not args.skip_lm:
+        m._esmc = esmc.Model(
+            esmc.ModelArgs(**TINY_ESMC) if args.tiny
+            else esmc.ModelArgs(hidden_size=cfg.get("lm_d_model", 2560),
+                                num_attention_heads=args.heads,
+                                num_hidden_layers=cfg.get("lm_num_layers", 80)))
+    m._lm_d_model = cfg.get("lm_d_model", 2560)
+    m._lm_num_layers = cfg.get("lm_num_layers", 80)
     m.set_dtype(args.mx_dtype)
     m.eval()
     mx.eval(m.parameters())
@@ -166,7 +176,13 @@ def esmfold2_phases(model, L, args):
                  residue_index=feats.get("residue_index"),
                  mol_type=feats.get("mol_type"),
                  token_mask=feats.get("token_attention_mask"))
-    lm = model.compute_lm_hidden_states(feats["input_ids"], **lm_kw)
+    if args.skip_lm:
+        # LanguageModelShim consumes (B, L, num_layers+1, d_model).
+        lm = mx.random.normal(
+            (1, L, model._lm_num_layers + 1, model._lm_d_model)
+        ).astype(args.mx_dtype)
+    else:
+        lm = model.compute_lm_hidden_states(feats["input_ids"], **lm_kw)
     mx.eval(lm)
     z, x_inputs, aux = model.trunk(feats, lm, num_loops=args.loops)
     mx.eval(z, x_inputs)
@@ -183,11 +199,13 @@ def esmfold2_phases(model, L, args):
             n_tokens=aux["n_tokens"], token_attention_mask=aux["tok_mask"],
             num_diffusion_samples=1, num_sampling_steps=args.steps)
 
-    return {
-        "lm": lambda: model.compute_lm_hidden_states(feats["input_ids"], **lm_kw),
-        "trunk": lambda: model.trunk(feats, lm, num_loops=args.loops),
-        "sampler": sampler,
-    }
+    phases = {}
+    if not args.skip_lm:
+        phases["lm"] = lambda: model.compute_lm_hidden_states(
+            feats["input_ids"], **lm_kw)
+    phases["trunk"] = lambda: model.trunk(feats, lm, num_loops=args.loops)
+    phases["sampler"] = sampler
+    return phases
 
 
 # ---------------------------------------------------------------------------
@@ -216,37 +234,53 @@ def _profile_once(model, fn, root):
 
 
 def sweep(model, make_phases, args, ceilings):
-    """Profile every phase at every length. Model is built once, outside."""
+    """Profile every phase at every length. The model is built once, outside.
+
+    Three timings per phase, because they answer different questions:
+      plain      compiled, no instrumentation -- the honest wall clock
+      bypassed   compiled regions routed back through Python -- comparable
+                 baseline for the profiled run, and the cost of losing fusion
+      profiled   per-layer attribution, only valid while bypassed
+    """
     rows, raw = [], {}
     per_class: dict[str, dict[int, dict]] = {}
     per_layer: dict[str, dict[int, dict]] = {}
-    detail = args.detail if args.detail else (
-        "full" if len(args.seq_len) == 1 else "summary")
+    detail = args.detail or ("full" if len(args.seq_len) == 1 else "summary")
 
     for L in args.seq_len:
         phases = make_phases(model, L, args)
-        row = {"L": L, "phase_s": {}, "lazy_s": {}, "peak_gb": 0.0}
+        row = {"L": L, "phase_s": {}, "plain_s": {}, "bypassed_s": {},
+               "lazy_s": {}, "peak_gb": 0.0}
         raw[L] = {}
         for label, fn in phases.items():
-            prof, lazy, peak = _profile_once(model, fn, args.root)
+            row["plain_s"][label] = time_plain(fn)
+            mx.clear_cache()
+
+            with bypass_compile(model) as n_bypassed:
+                row["bypassed_s"][label] = time_plain(fn) if n_bypassed else \
+                    row["plain_s"][label]
+                prof, lazy, peak = _profile_once(model, fn, args.root)
+
             row["phase_s"][label] = prof.wall_s
             row["lazy_s"][label] = lazy.wall_s
             row["peak_gb"] = max(row["peak_gb"], peak)
+            row.setdefault("bypassed_sites", n_bypassed)
             raw[L][label] = {"eval": prof.as_dict(), "lazy": lazy.as_dict(),
-                             "peak_gb": peak}
+                             "peak_gb": peak,
+                             "plain_s": row["plain_s"][label],
+                             "bypassed_s": row["bypassed_s"][label]}
 
-            for st in prof.by_class().values():
-                d = per_class.setdefault(st.cls, {}).setdefault(
-                    L, {"calls": 0, "excl_s": 0.0, "moved_bytes": 0})
-                d["calls"] += st.calls
-                d["excl_s"] += st.excl_s
-                d["moved_bytes"] += st.moved_bytes
-            for st in prof.active():
-                d = per_layer.setdefault(st.path, {}).setdefault(
-                    L, {"calls": 0, "excl_s": 0.0, "moved_bytes": 0})
-                d["calls"] += st.calls
-                d["excl_s"] += st.excl_s
-                d["moved_bytes"] += st.moved_bytes
+            for store, items in ((per_class, prof.by_class().values()),
+                                 (per_layer, prof.active())):
+                for st in items:
+                    key = st.cls if store is per_class else st.path
+                    d = store.setdefault(key, {}).setdefault(
+                        L, {"calls": 0, "excl_s": 0.0, "incl_s": 0.0,
+                            "moved_bytes": 0})
+                    d["calls"] += st.calls
+                    d["excl_s"] += st.excl_s
+                    d["incl_s"] += st.incl_s
+                    d["moved_bytes"] += st.moved_bytes
 
             if detail == "full":
                 print(f"\n{'#'*78}\n# L={L}  {label}   "
@@ -262,23 +296,59 @@ def sweep(model, make_phases, args, ceilings):
             del prof, lazy
             mx.clear_cache()
 
-        row["total_s"] = sum(row["phase_s"].values())
+        row["total_s"] = sum(row["plain_s"].values())
+        row["profiled_total_s"] = sum(row["phase_s"].values())
         tot_lazy = sum(row["lazy_s"].values())
-        row["lazy_share"] = tot_lazy / row["total_s"] if row["total_s"] else 0.0
+        row["lazy_share"] = (tot_lazy / row["profiled_total_s"]
+                             if row["profiled_total_s"] else 0.0)
         rows.append(row)
         if detail == "summary":
-            parts = "  ".join(f"{k} {v:.3f}s" for k, v in row["phase_s"].items())
+            parts = "  ".join(f"{k} {v:.3f}s" for k, v in row["plain_s"].items())
             print(f"  L={L:<5} {parts}   total {row['total_s']:.3f}s"
-                  f"   lazy {100*row['lazy_share']:.0f}%   peak {row['peak_gb']:.2f}GB")
+                  f"   lazy {100*row['lazy_share']:.1f}%"
+                  f"   peak {row['peak_gb']:.2f}GB")
 
+    _finalize(per_class)
+    _finalize(per_layer)
     return rows, per_class, per_layer, raw
 
 
+def _finalize(store):
+    """Fill in achieved GB/s, suppressed where children did the work."""
+    for byL in store.values():
+        for d in byL.values():
+            container = d["incl_s"] > 0 and (d["excl_s"] / d["incl_s"]) < 0.5
+            d["gbs"] = (None if container or d["excl_s"] <= 0
+                        else d["moved_bytes"] / d["excl_s"] / 1e9)
+
+
+def render_compile(rows, phases) -> str:
+    """What mx.compile is worth, per phase."""
+    out = ["== cost of bypassing mx.compile",
+           "  (attribution needs the bypass; this is what it costs, so you can",
+           "   tell a real layer cost from a lost-fusion artefact)"]
+    head = f"{'L':>6}" + "".join(f"{p[:9]:>22}" for p in phases)
+    out += [head, "-" * len(head)]
+    for r in rows:
+        line = f"{r['L']:>6}"
+        for p in phases:
+            a, b = r["plain_s"].get(p), r["bypassed_s"].get(p)
+            line += f"{a:>9.2f}->{b:>7.2f} {b/a if a else 0:>3.1f}x"
+        out.append(line)
+    return "\n".join(out)
+
+
 def _report(rows, per_class, per_layer, args, ceilings, extra=None):
-    phases = list(rows[0]["phase_s"]) if rows else []
+    phases = list(rows[0]["plain_s"]) if rows else []
+    peak = max((r["peak_gb"] for r in rows), default=0.0)
+    print()
+    print(render_memory(peak))
     print()
     print(render_sweep(rows, phases))
     print()
+    if rows and rows[0].get("bypassed_sites"):
+        print(render_compile(rows, phases))
+        print()
     print(render_scaling(per_class, args.seq_len, ceilings, top=args.top))
     print()
     print(render_scaling(per_layer, args.seq_len, ceilings, top=args.top,
@@ -287,8 +357,8 @@ def _report(rows, per_class, per_layer, args, ceilings, extra=None):
     print(render_verdict(rows, per_class, args.seq_len, ceilings,
                          top=args.verdict_top))
     if args.json:
-        payload = {"ceilings": ceilings.as_dict(), "rows": rows,
-                   "per_class": per_class, "per_layer": per_layer,
+        payload = {"ceilings": ceilings.as_dict(), "memory": memory_info(),
+                   "rows": rows, "per_class": per_class, "per_layer": per_layer,
                    "args": {k: v for k, v in vars(args).items()
                             if isinstance(v, (int, float, str, bool, list))}}
         if extra:
@@ -372,6 +442,9 @@ def main():
     common.add_argument("--weights", action="store_true",
                         help="load the real checkpoint instead of random init")
     common.add_argument("--chains", type=int, default=1)
+    common.add_argument("--skip-lm", action="store_true",
+                        help="do not build ESMC (~16 GB); synthesise its "
+                             "hidden states and profile trunk + sampler only")
 
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

@@ -166,8 +166,21 @@ class ModuleStat:
         """Logical traffic charged to this module's own work."""
         return self.in_bytes + self.out_bytes + self.param_bytes
 
-    def gbs(self) -> float:
-        return self.moved_bytes / self.excl_s / 1e9 if self.excl_s > 0 else 0.0
+    @property
+    def is_container(self) -> bool:
+        """True when children did most of the work.
+
+        Byte counts are per call, but exclusive time is not. A module that
+        just forwards a large tensor to its children gets charged the full
+        tensor with almost no time, which reports as thousands of GB/s. That
+        number is meaningless, so suppress it.
+        """
+        return self.incl_s > 0 and (self.excl_s / self.incl_s) < 0.5
+
+    def gbs(self) -> Optional[float]:
+        if self.excl_s <= 0 or self.is_container:
+            return None
+        return self.moved_bytes / self.excl_s / 1e9
 
     def as_dict(self) -> dict:
         return {"path": self.path, "cls": self.cls, "calls": self.calls,
@@ -400,18 +413,18 @@ def render(stats: list[ModuleStat], ceilings: Optional[Ceilings] = None,
     for s in rows[:top]:
         name = _elide(s.path, w - 1)
         pct = 100 * s.excl_s / total if total else 0.0
+        g = s.gbs()
         line = (f"{name:<{w}}{s.calls:>7}{s.excl_s:>9.3f}{pct:>6.1f}"
                 f"{s.incl_s:>9.3f}{_fmt_bytes(s.moved_bytes):>10}"
-                f"{s.gbs():>9.1f}")
+                f"{(f'{g:.1f}' if g is not None else '-'):>9}")
         if peak:
-            frac = s.gbs() / peak
-            if frac >= 0.6:
-                v = "BW-BOUND"
-            elif frac >= 0.25:
-                v = "part BW"
+            if g is None:
+                line += f"{'-':>7}{'container':>14}"
             else:
-                v = "not BW"
-            line += f"{100*frac:>7.0f}{v:>14}"
+                frac = g / peak
+                v = ("BW-BOUND" if frac >= 0.6 else
+                     "part BW" if frac >= 0.25 else "not BW")
+                line += f"{100*frac:>7.0f}{v:>14}"
         out.append(line)
     shown = sum(s.excl_s for s in rows[:top])
     out.append(f"{'':<{w}}{'':>7}{shown:>9.3f}"
@@ -472,15 +485,21 @@ def fit_exponent(xs: list[float], ys: list[float]) -> Optional[float]:
     return num / den if den > 0 else None
 
 
-def render_sweep(rows: list[dict], phases: list[str]) -> str:
-    """Per-length phase totals. `rows` come from the sweep driver."""
+def render_sweep(rows: list[dict], phases: list[str],
+                 key: str = "plain_s") -> str:
+    """Per-length phase totals, from the uninstrumented compiled runs.
+
+    `key` selects which timing to table. plain_s is the honest wall clock;
+    phase_s is the instrumented one and runs slower by construction.
+    """
     head = f"{'L':>6}" + "".join(f"{p[:11]+' s':>13}" for p in phases)
     head += f"{'total s':>10}{'lazy %':>8}{'peak GB':>9}"
-    out = ["== phase time vs sequence length", head, "-" * len(head)]
+    out = ["== phase time vs sequence length  (uninstrumented, compiled)",
+           head, "-" * len(head)]
     for r in rows:
         line = f"{r['L']:>6}"
         for p in phases:
-            line += f"{r['phase_s'].get(p, float('nan')):>13.3f}"
+            line += f"{r[key].get(p, float('nan')):>13.3f}"
         line += (f"{r['total_s']:>10.3f}{100*r['lazy_share']:>8.1f}"
                  f"{r['peak_gb']:>9.2f}")
         out.append(line)
@@ -491,7 +510,7 @@ def render_sweep(rows: list[dict], phases: list[str]) -> str:
                    else "  not enough points to fit a scaling exponent")
         for p in phases:
             kp = fit_exponent([r["L"] for r in rows],
-                              [r["phase_s"].get(p, 0.0) for r in rows])
+                              [r[key].get(p, 0.0) for r in rows])
             if kp is not None:
                 out.append(f"    {p:<12} L^{kp:.2f}")
     return "\n".join(out)
@@ -525,15 +544,19 @@ def render_scaling(per_class: dict, lengths: list[int],
             continue
         k = fit_exponent(lengths,
                          [byL.get(L, {}).get("excl_s", 0.0) for L in lengths])
-        gbs = at["moved_bytes"] / at["excl_s"] / 1e9 if at["excl_s"] > 0 else 0.0
+        gbs = at.get("gbs")
         line = (f"{_elide(cls, w-1):<{w}}{at['calls']:>7}{at['excl_s']:>12.3f}"
                 f"{100*at['excl_s']/total:>6.1f}"
-                f"{(f'{k:.2f}' if k is not None else '-'):>7}{gbs:>9.1f}")
+                f"{(f'{k:.2f}' if k is not None else '-'):>7}"
+                f"{(f'{gbs:.1f}' if gbs else '-'):>9}")
         if peak:
-            frac = gbs / peak
-            v = "BW-BOUND" if frac >= 0.6 else ("part BW" if frac >= 0.25
-                                                else "not BW")
-            line += f"{100*frac:>6.0f}{v:>13}"
+            if not gbs:
+                line += f"{'-':>6}{'container':>13}"
+            else:
+                frac = gbs / peak
+                v = ("BW-BOUND" if frac >= 0.6 else
+                     "part BW" if frac >= 0.25 else "not BW")
+                line += f"{100*frac:>6.0f}{v:>13}"
         out.append(line)
     return "\n".join(out)
 
@@ -565,14 +588,120 @@ def render_verdict(rows: list[dict], per_class: dict, lengths: list[int],
             continue
         k = fit_exponent(lengths,
                          [byL.get(L, {}).get("excl_s", 0.0) for L in lengths])
-        gbs = at["moved_bytes"] / at["excl_s"] / 1e9
+        gbs = at.get("gbs")
+        grow = (f", grows as L^{k:.1f}" if k is not None else "")
+        if not gbs:
+            out.append(f"  {100*at['excl_s']/total:5.1f}%  {cls:<28} "
+                       f"  (container){grow}")
+            out.append("         -> time is in its children, not in itself")
+            continue
         frac = gbs / ceilings.peak_bw_gbs
         why = ("saturating bandwidth; fuse to cut round trips"
                if frac >= 0.6 else
                "not bandwidth-limited; check a gputrace for the real limiter"
                if frac < 0.25 else "partly bandwidth-limited")
-        grow = (f", grows as L^{k:.1f}" if k is not None else "")
         out.append(f"  {100*at['excl_s']/total:5.1f}%  {cls:<28} "
                    f"{gbs:6.1f} GB/s ({100*frac:.0f}% of peak){grow}")
         out.append(f"         -> {why}")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# seeing inside mx.compile
+# ---------------------------------------------------------------------------
+
+
+COMPILED_ATTR_PAIRS = (("_compiled", "_apply_blocks"),)
+
+
+@contextmanager
+def bypass_compile(model: nn.Module,
+                   pairs=COMPILED_ATTR_PAIRS) -> Iterator[int]:
+    """Route compiled call sites back through their Python implementation.
+
+    mx.compile traces once and replays the captured graph, so submodule
+    __call__ never runs again after the first call. A profiler sees nothing
+    inside a compiled region and charges the whole cost to the enclosing
+    module. FoldingTrunk does exactly this, which hides the entire pair stack.
+
+    mlx.gc_func exposes no handle on the original function, so the bypass has
+    to know the convention: a module holding `_compiled = mx.compile(self.f)`
+    also still has `f`. Swap the attribute, restore on exit.
+
+    Bypassing is not free: the uncompiled path loses fusion, so absolute times
+    grow. Use it for attribution, and time the compiled path separately for
+    the honest number.
+    """
+    saved = []
+    for _, mod in model.named_modules():
+        for compiled_attr, plain_attr in pairs:
+            fn = getattr(mod, plain_attr, None)
+            if compiled_attr in mod.__dict__ and callable(fn):
+                saved.append((mod, compiled_attr, mod.__dict__[compiled_attr]))
+                mod.__dict__[compiled_attr] = fn
+    try:
+        yield len(saved)
+    finally:
+        for mod, attr, original in saved:
+            mod.__dict__[attr] = original
+
+
+def time_plain(fn: Callable[[], Any], warmup: int = 1) -> float:
+    """Wall time with nothing attached: the number to trust for totals."""
+    for _ in range(warmup):
+        mx.eval(fn())
+    mx.synchronize()
+    t0 = time.perf_counter()
+    out = fn()
+    mx.eval(out)
+    mx.synchronize()
+    dt = time.perf_counter() - t0
+    del out
+    return dt
+
+
+# ---------------------------------------------------------------------------
+# memory headroom, i.e. how close we are to swapping
+# ---------------------------------------------------------------------------
+
+
+def memory_info() -> dict:
+    # mx.metal.device_info is deprecated in favour of mx.device_info.
+    getter = getattr(mx, "device_info", None) or mx.metal.device_info
+    try:
+        info = getter()
+    except Exception:
+        return {}
+    if not info.get("memory_size"):
+        return {}
+    return {
+        "memory_size": info.get("memory_size", 0),
+        "max_recommended_working_set_size": info.get(
+            "max_recommended_working_set_size", 0),
+        "architecture": info.get("architecture", "?"),
+    }
+
+
+def render_memory(peak_gb: float, info: Optional[dict] = None) -> str:
+    info = info if info is not None else memory_info()
+    if not info:
+        return f"== memory\n  peak {peak_gb:.2f} GB  (no Metal device info)"
+    total = info.get("memory_size", 0) / 2**30
+    rec = info.get("max_recommended_working_set_size", 0) / 2**30
+    out = ["== memory",
+           f"  architecture              : {info.get('architecture','?')}",
+           f"  unified memory            : {total:8.2f} GB",
+           f"  max recommended workingset: {rec:8.2f} GB",
+           f"  peak this run             : {peak_gb:8.2f} GB"]
+    if rec > 0:
+        frac = peak_gb / rec
+        out.append(f"  used of recommended       : {100*frac:8.1f} %")
+        if frac >= 1.0:
+            out.append("  => OVER the recommended working set. Metal is spilling "
+                       "to swap and every timing above is suspect.")
+        elif frac >= 0.85:
+            out.append("  => close to the limit. Drop --seq-len or pass --skip-lm "
+                       "before trusting the long lengths.")
+        else:
+            out.append("  => headroom is fine; timings are not swap-contaminated.")
     return "\n".join(out)
