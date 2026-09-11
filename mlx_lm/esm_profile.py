@@ -39,6 +39,7 @@ from .esm_profiler import (
     render_ceilings,
     render_modes,
     render_scaling,
+    render_dtype_mix,
     render_memory,
     render_shapes,
     render_sweep,
@@ -285,6 +286,9 @@ def sweep(model, make_phases, args, ceilings):
                     d["moved_bytes"] += st.moved_bytes
                     d["flops"] += st.flops
 
+            print(f"\n-- L={L} {label}")
+            print(render_dtype_mix(prof.dtype_bytes,
+                                   title=f"L={L} {label}: traffic by dtype"))
             if args.shapes and L == args.seq_len[-1]:
                 print(f"\n{'#'*78}\n# L={L}  {label}: real shapes and per-call "
                       f"cost\n{'#'*78}")
@@ -515,6 +519,36 @@ def cmd_micro(args):
         del z, z2, g, b, ln, raw, sv, pe
         mx.clear_cache()
 
+    # The trunk runs fp32, not the requested bf16, and its norms see widths
+    # of 256 and 512. The first version of this benchmark tested bf16 at 256
+    # only, which is the one combination the model never uses at that point.
+    print("\n== LayerNorm across the dtype and width combinations the model "
+          "actually uses")
+    hdr = (f"  {'dtype':<7}{'width':>7}{'MiB':>8}{'floor ms':>10}"
+           f"{'ln ms':>9}{'ln GB/s':>9}{'%BW':>6}{'vs floor':>10}")
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    L = max(args.seq_len)
+    for name, edt in (("bf16", mx.bfloat16), ("f32", mx.float32)):
+        for W in args.ln_widths:
+            x = mx.random.normal((1, L, L, W)).astype(edt)
+            gw = mx.ones((W,)).astype(edt)
+            bw_ = mx.zeros((W,)).astype(edt)
+            mx.eval(x, gw, bw_)
+            moved = 2 * x.nbytes
+            t_f = _time_op(lambda: x + 1, iters=args.iters)
+            t_n = _time_op(lambda: mx.fast.layer_norm(x, gw, bw_, 1e-5),
+                           iters=args.iters)
+            gbs = moved / t_n / 1e9
+            print(f"  {name:<7}{W:>7}{x.nbytes/2**20:>8.0f}{t_f*1e3:>10.2f}"
+                  f"{t_n*1e3:>9.2f}{gbs:>9.1f}"
+                  f"{100*gbs/c.peak_bw_gbs:>6.0f}{t_n/t_f:>9.2f}x")
+            out["cases"].append({"L": L, "op": f"layer_norm/{name}/{W}",
+                                 "ms": t_n * 1e3, "gbs": gbs,
+                                 "floor_ms": t_f * 1e3})
+            del x, gw, bw_
+            mx.clear_cache()
+
     print("\n  Read it like this: any LayerNorm row far above the copy floor "
           "is\n  a kernel problem, not an unavoidable cost. The floor is the "
           "least\n  any op touching this tensor can possibly take.")
@@ -597,6 +631,8 @@ def main():
     mi.add_argument("--seq-len", type=int, nargs="+", default=[256, 500])
     mi.add_argument("--c-z", type=int, default=256)
     mi.add_argument("--iters", type=int, default=20)
+    mi.add_argument("--ln-widths", type=int, nargs="+",
+                    default=[256, 512, 1024])
     mi.set_defaults(fn=cmd_micro)
 
     args = p.parse_args()

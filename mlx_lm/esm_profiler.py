@@ -47,6 +47,16 @@ def iter_arrays(obj: Any) -> Iterator[mx.array]:
             yield from iter_arrays(o)
 
 
+_DT_SHORT = {"float32": "f32", "bfloat16": "bf16", "float16": "f16",
+             "int32": "i32", "int64": "i64", "bool": "b8", "uint32": "u32",
+             "int8": "i8", "uint8": "u8", "int16": "i16"}
+
+
+def _dt(dtype) -> str:
+    name = str(dtype).rsplit(".", 1)[-1]
+    return _DT_SHORT.get(name, name)
+
+
 def tensor_bytes(obj: Any) -> int:
     return sum(a.nbytes for a in iter_arrays(obj))
 
@@ -240,6 +250,7 @@ class LayerProfiler:
         self.record_shapes = record_shapes
         self.max_depth = max_depth
         self.stats: dict[str, ModuleStat] = {}
+        self.dtype_bytes: dict[str, int] = {}
         self._registry: dict[int, str] = {}
         self._patched: list[tuple[type, Callable]] = []
         self._stack: list[list] = []   # [path, t_start, child_time, alloc0]
@@ -312,7 +323,8 @@ class LayerProfiler:
             mx.synchronize()
         in_bytes = tensor_bytes(args) + tensor_bytes(kwargs)
         if self.record_shapes and len(st.shapes) < 4:
-            st.shapes.append([list(a.shape) for a in iter_arrays(args)][:4])
+            st.shapes.append([f"{list(a.shape)}{_dt(a.dtype)}"
+                              for a in iter_arrays(args)][:4])
         alloc0 = mx.get_active_memory()
 
         frame = [path, time.perf_counter(), 0.0]
@@ -334,6 +346,12 @@ class LayerProfiler:
         st.in_bytes += in_bytes
         st.out_bytes += tensor_bytes(out)
         st.param_bytes += st.own_params
+        for a in iter_arrays(args):
+            k = _dt(a.dtype)
+            self.dtype_bytes[k] = self.dtype_bytes.get(k, 0) + a.nbytes
+        for a in iter_arrays(out):
+            k = _dt(a.dtype)
+            self.dtype_bytes[k] = self.dtype_bytes.get(k, 0) + a.nbytes
         if st.gemm_shape:
             in_f, out_f = st.gemm_shape
             rows = sum(a.size for a in iter_arrays(args)) // max(in_f, 1)
@@ -368,6 +386,7 @@ class LayerProfiler:
 
     def as_dict(self) -> dict:
         return {"mode": self.mode, "wall_s": self.wall_s,
+                "dtype_bytes": self.dtype_bytes,
                 "modules": [s.as_dict() for s in self.active()],
                 "by_class": [s.as_dict() for s in self.by_class().values()]}
 
@@ -421,7 +440,12 @@ def _elide(path: str, width: int) -> str:
     if len(path) <= width:
         return path
     parts = path.split(".")
-    abbr = lambda c: "".join(w[0] for w in c.split("_") if w) or c[:1]
+
+    def abbr(c):
+        if c.isdigit():          # a block index is the identity of the row
+            return c
+        return "".join(w[0] for w in c.split("_") if w) or c[:1]
+
     for keep in range(min(4, len(parts)), 0, -1):
         cand = ".".join([abbr(c) for c in parts[:-keep]] + parts[-keep:])
         if len(cand) <= width:
@@ -781,5 +805,26 @@ def render_shapes(stats: list[ModuleStat], ceilings: Optional[Ceilings] = None,
             f"{_elide(s.path, w-1):<{w}}{s.cls[:17]:>18}{s.calls:>7}"
             f"{1e3*s.excl_s/max(s.calls,1):>10.2f}"
             f"{s.moved_bytes/max(s.calls,1)/2**20:>9.1f}"
-            f"{(f'{g:.1f}' if g else '-'):>8}  {shp[:60]}")
+            f"{(f'{g:.1f}' if g else '-'):>8}  {shp[:72]}")
+    return "\n".join(out)
+
+
+def render_dtype_mix(dtype_bytes: dict, title: str = "traffic by dtype") -> str:
+    """Where the bytes actually go, by element type.
+
+    Asking for bfloat16 does not mean you get it. A single fp32 tensor early
+    in the graph promotes every downstream op, and nothing in a timing table
+    shows that -- the layer just looks twice as expensive as it should.
+    """
+    total = sum(dtype_bytes.values()) or 1
+    out = [f"== {title}",
+           f"  {'dtype':<10}{'GB':>10}{'%':>8}", "  " + "-" * 26]
+    for k, v in sorted(dtype_bytes.items(), key=lambda kv: -kv[1]):
+        out.append(f"  {k:<10}{v/1e9:>10.2f}{100*v/total:>8.1f}")
+    f32 = dtype_bytes.get("f32", 0)
+    if f32 / total >= 0.5:
+        out.append(f"  => {100*f32/total:.0f}% of traffic is fp32. Every "
+                   "bandwidth-bound op is paying 2x.")
+        out.append("     Find the first fp32 tensor and cast it; promotion "
+                   "spreads downstream.")
     return "\n".join(out)
