@@ -423,6 +423,97 @@ times for nothing. At N=8000 that intermediate is 244 MB.
 Two fixes: cache the mask (trivial), or block-sparse the attention (real work).
 Together ~1.5-2% of the run, and it stops the mask exploding at long chains.
 
+## The GEMM ceiling hunt. All three levers are dead.
+
+The trunk is 86% GEMM at 90-99% of a measured roof, every non-GEMM part is at
+a bandwidth roof, and the GPU is 100% resident. So the only remaining
+questions were about the ceiling itself. All three are now answered.
+
+### 1. MLX's GEMM peak is 6.09 TFLOP/s, and we are within 6% of it
+
+| N | fp32 | bf16 | fp16 |
+|---|---|---|---|
+| 512 | 0.96 | 1.27 | 1.37 |
+| 1024 | 3.71 | 4.11 | 4.20 |
+| 2048 | 5.09 | 5.73 | 5.72 |
+| 4096 | 5.22 | 6.01 | 6.03 |
+| 8192 | 5.28 | **6.09** | 6.07 |
+
+The trunk's GEMMs run at 5.54-5.9. Headroom against MLX's own peak: **+6%**.
+The ~8.6 TFLOP/s ALU figure is not reachable through MLX's GEMM; that gap is
+upstream MLX's kernels, not anything in this port.
+
+### 2. bf16 is the fastest dtype. fp16 gives nothing.
+
+| shape | K | N | fp32 | bf16 | fp16 | best |
+|---|---|---|---|---|---|---|
+| `proj_bundle W@x.T` | 256 | 1024 | 5.18 | **5.95** | 5.93 | bf16 |
+| `proj_emit`/`proj_gate` | 256 | 256 | 4.97 | **5.78** | 5.56 | bf16 |
+| `pair_transition w12` | 256 | 2048 | 4.89 | 5.78 | 5.78 | tie |
+| `pair_transition w3` | 1024 | 256 | 5.21 | **5.94** | 5.94 | tie |
+
+bf16 wins or ties everywhere. The fp16 hypothesis -- that Apple GPUs run fp16
+at full rate while bf16 support is newer -- is **false on this chip**.
+
+### 3. Padding is a net loss, despite the contraction liking it
+
+| L | L%64 | ms | TFLOP/s | ns/elem | pad cost | net vs 500 |
+|---|---|---|---|---|---|---|
+| 448 | 0 | 7.98 | 5.77 | 0.155 | — | — |
+| 500 | 52 | 12.28 | 5.21 | 0.192 | 1.000 | 1.000 |
+| 504 | 56 | 11.85 | 5.53 | 0.182 | 1.016 | **0.965** |
+| 512 | **0** | 11.78 | **5.83** | 0.176 | 1.049 | **0.959** |
+| 576 | 0 | 17.20 | 5.69 | 0.203 | 1.327 | 1.401 |
+
+L=500 runs the contraction at 5.21 TFLOP/s against 5.83 at L=512, so
+alignment is worth 12% *on the contraction*. But the contraction is only
+**12.9%** of a PairUpdateBlock, and padding the pair tensor makes the other
+87.1% do 4.9% more work:
+
+| pad target | contraction | everything else | net on trunk |
+|---|---|---|---|
+| 504 | -0.45% | +1.39% | **+0.94% LOSS** |
+| 512 | -0.53% | +4.27% | **+3.74% LOSS** |
+
+Padding only inside `_contract` and cropping after is worse still: saves
+1.00ms per block, costs 3.85ms in the pad and crop copies.
+
+Note L=576 is 64-aligned yet worse per element than L=500, and L=448 is the
+best of all. So the trend is mostly cache footprint, with alignment a
+secondary bonus. Alignment alone does not explain it.
+
+## TriMul's 72% of GEMM roof is a mixing artefact, not headroom
+
+With raw-matmul FLOPs now counted, TriMul reads 9.169s, 39.6%, 4.34 TFLOP/s =
+72% of roof, 760.5 FLOP/byte. That 72% is one rate for a mixed module. Split
+it:
+
+| part | ms | rate |
+|---|---|---|
+| `proj_bundle` | 22.06 | 5.95 TFLOP/s, **99% of roof** |
+| contraction | 11.87 | 5.39 TFLOP/s, **90% of roof** |
+| gating (compiled) | 3.63 | 211.6 GB/s, **at BW floor** |
+| epilogue (compiled) | 2.30 | 218.7 GB/s, **above streaming ceiling** |
+
+Its GEMM portion runs at ~95% of roof. The 72% is diluted by the
+bandwidth-bound elementwise work, which has no FLOPs, plus instrumentation
+sync across 204 calls. **Nothing to win.**
+
+## Where this leaves the trunk
+
+Trunk 18.965s at L=500, and every component is at a roof:
+
+| class | share | limiter |
+|---|---|---|
+| `Linear` | 43.3% | 92% of GEMM roof |
+| `TriangleMultiplicativeUpdate` | 39.6% | ~95% of GEMM roof on its GEMM part |
+| `LayerNorm` | 5.2% | 62% of BW roof, fusion ceiling 1.8% |
+| `SwiGLUMLP` | 5.0% | at `mx.compile` floor |
+| `SWA3DRoPEAttention` | 2.0% | **0.6 GB/s -- the only one left** |
+
+`Linear` at 179.9 FLOP/byte and TriMul at 760.5 stay **compute-bound on an M5
+Ultra**, so 83% of the trunk takes the full M5 compute uplift for free.
+
 ## Harness bugs that invalidated earlier numbers
 
 Read this before comparing against anything older than the commit named.
