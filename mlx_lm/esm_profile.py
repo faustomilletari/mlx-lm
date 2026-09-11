@@ -677,8 +677,14 @@ def cmd_trimul(args):
         print("\n-- B. the contraction: do the transposes materialise?")
         print(hdr)
         print("  " + "-" * (len(hdr) - 2))
-        t_as = row("B", "_contract as written (3 transposes)",
-                   lambda: tm._contract(left, right), flops=f_contract)
+        def contract_bijc(a, bb):
+            """Old layout: (B,i,j,C) in, permute C to the batch axis."""
+            l_ = a.transpose(0, 3, 1, 2)
+            r_ = bb.transpose(0, 3, 1, 2)
+            return (l_ @ r_.transpose(0, 1, 3, 2)).transpose(0, 2, 3, 1)
+
+        t_as = row("B", "(B,i,j,C) in: permute + matmul (old)",
+                   lambda: contract_bijc(left, right), flops=f_contract)
         row("B", "pre-transposed in, transpose out",
             lambda: (ltc @ rtc.transpose(0, 1, 3, 2)).transpose(0, 2, 3, 1),
             flops=f_contract, base=t_as)
@@ -690,7 +696,17 @@ def cmd_trimul(args):
             flops=f_contract, base=t_as)
         row("B", "transpose+contiguous only, no matmul",
             lambda: mx.contiguous(left.transpose(0, 3, 1, 2)), base=t_as)
-        del lt, rt, ltc, rtc
+
+        # Channel-first: (C,B,i,j) in, only the batch axes move.
+        lc = mx.contiguous(left.transpose(3, 0, 1, 2))
+        rc = mx.contiguous(right.transpose(3, 0, 1, 2))
+        mx.eval(lc, rc)
+        row("B", "(C,B,i,j) in: batch permute only (new)",
+            lambda: (lc.transpose(1, 0, 2, 3)
+                     @ rc.transpose(1, 0, 2, 3).transpose(0, 1, 3, 2)
+                     ).transpose(0, 2, 3, 1),
+            flops=f_contract, base=t_as)
+        del lt, rt, ltc, rtc, lc, rc
 
         # ---- C. the gating chain ---------------------------------------
         bundled = mx.random.normal((1, L, L, 4 * D)).astype(dt)
@@ -741,6 +757,51 @@ def cmd_trimul(args):
         row("D", "floor: 3 reads, 1 write", lambda: pair + mixed + gate,
             moved=moved_ep, base=t_e)
 
+        # ---- E. the GEMM orientation the channel-first branch flips ----
+        M = L * L
+        xg = mx.random.normal((M, D)).astype(dt)
+        wg = mx.random.normal((4 * D, D)).astype(dt)
+        mx.eval(xg, wg)
+        f_bundle = 2.0 * M * D * 4 * D
+
+        print("\n-- E. proj_bundle orientation: x @ W.T vs W @ x.T")
+        print(hdr)
+        print("  " + "-" * (len(hdr) - 2))
+        t_nt = row("E", f"x @ W.T  -> (M={M}, N={4*D}) (old)",
+                   lambda: xg @ wg.T, flops=f_bundle)
+        row("E", f"W @ x.T  -> (M={4*D}, N={M}) (new)",
+            lambda: wg @ xg.T, flops=f_bundle, base=t_nt)
+
+        # full chain, both layouts, compiled as the trunk runs them
+        zc = mx.random.normal((1, L, L, D)).astype(dt)
+        mx.eval(zc)
+
+        def chain_old(x, w, msk):
+            bundled = x.reshape(-1, D) @ w.T
+            bundled = bundled.reshape(1, L, L, 4 * D)
+            sig, gl = mx.split(bundled, 2, axis=-1)
+            r = sig * mx.sigmoid(gl) * msk[..., None]
+            a, bb = mx.split(r, 2, axis=-1)
+            return contract_bijc(a, bb)
+
+        def chain_new(x, w, msk):
+            bundled = (w @ x.reshape(-1, D).T).reshape(4 * D, 1, L, L)
+            sig, gl = mx.split(bundled, 2, axis=0)
+            r = sig * mx.sigmoid(gl) * msk[None]
+            a, bb = mx.split(r, 2, axis=0)
+            return (a.transpose(1, 0, 2, 3)
+                    @ bb.transpose(1, 0, 2, 3).transpose(0, 1, 3, 2)
+                    ).transpose(0, 2, 3, 1)
+
+        c_old, c_new = mx.compile(chain_old), mx.compile(chain_new)
+        print("\n-- E2. gating + contraction end to end, compiled")
+        print(hdr)
+        print("  " + "-" * (len(hdr) - 2))
+        t_co = row("E2", "old layout, compiled", lambda: c_old(zc, wg, m))
+        row("E2", "channel-first, compiled", lambda: c_new(zc, wg, m),
+            base=t_co)
+        del xg, wg, zc
+
         del tm, z, m, left, right, mixed, gate, pair
         mx.clear_cache()
 
@@ -754,6 +815,10 @@ def cmd_trimul(args):
     print("     trivial arithmetic, so it is what a fused kernel could reach.")
     print("  C/D: whatever 'inside mx.compile' already wins is NOT available")
     print("     to a custom kernel -- the trunk is already compiled.")
+    print("  E2: the one that decides fm/trimul-channel-first. The new layout")
+    print("     removes two copies but flips the proj_bundle GEMM to a very")
+    print("     wide N. If E2 'channel-first' is not faster, the flipped GEMM")
+    print("     costs more than the copies it saves and the branch is dead.")
     if args.json:
         save_json(args.json, out)
         print(f"\nwrote {args.json}")
