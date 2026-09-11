@@ -802,6 +802,41 @@ def cmd_trimul(args):
             base=t_co)
         del xg, wg, zc
 
+        # ---- F. what could LN -> GEMM fusion actually buy? -------------
+        # Fusion does not delete the norm. A fused kernel still needs the row
+        # stats before it can normalise, so what it removes is the norm's
+        # write and the GEMM's separate read of it. Best case is therefore
+        # (GEMM on pre-normalised input) + (a stats-only pass).
+        gw = mx.random.normal((4 * D, D)).astype(dt)
+        zf = mx.random.normal((1, L, L, D)).astype(dt)
+        g1 = mx.ones((D,)).astype(dt)
+        b1 = mx.zeros((D,)).astype(dt)
+        pre = mx.fast.layer_norm(zf, g1, b1, 1e-5)
+        mx.eval(gw, zf, g1, b1, pre)
+
+        print("\n-- F. the ceiling on LayerNorm -> GEMM fusion")
+        print(hdr)
+        print("  " + "-" * (len(hdr) - 2))
+        t_ln = row("F", "layer_norm(z) alone", 
+                   lambda: mx.fast.layer_norm(zf, g1, b1, 1e-5),
+                   moved=2 * zf.nbytes)
+        t_both = row("F", "proj(layer_norm(z))  (as the model does)",
+                     lambda: mx.fast.layer_norm(zf, g1, b1, 1e-5)
+                     .reshape(-1, D) @ gw.T)
+        t_gemm = row("F", "proj(pre-normalised)  (GEMM only)",
+                     lambda: pre.reshape(-1, D) @ gw.T, base=t_both)
+        t_stats = row("F", "row mean+var only (stats a kernel still needs)",
+                      lambda: (mx.mean(zf, axis=-1), mx.var(zf, axis=-1)),
+                      base=t_both)
+        best = t_gemm + t_stats
+        print(f"  {'implied best fused = GEMM + stats':<42}{best*1e3:>9.2f}"
+              f"{'':>8}{'':>8}{best/t_both:>7.2f}x")
+        print(f"  -> ceiling on the saving: {(t_both-best)*1e3:.2f} ms per "
+              f"norm-GEMM pair,")
+        print(f"     i.e. {100*(t_both-best)/t_both:.0f}% of that pair. "
+              f"306 such pairs in the trunk.")
+        del gw, zf, g1, b1, pre
+
         del tm, z, m, left, right, mixed, gate, pair
         mx.clear_cache()
 
