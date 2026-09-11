@@ -28,13 +28,13 @@ from .esm_profiler import memory_info, save_json
 GB = 2 ** 30
 
 
-def _synth(L, atoms_per_token, dtype):
-    from .esm_profile import synth_feats
+def _synth(L, args):
+    from .esm_profile import feats_from_args
 
-    feats = synth_feats(L, atoms_per_token, 1)
+    dtype = args.mx_dtype
     feats = {k: (v.astype(dtype) if v.dtype in
                  (mx.float32, mx.float16, mx.bfloat16) else v)
-             for k, v in feats.items()}
+             for k, v in feats_from_args(L, args).items()}
     mx.eval(list(feats.values()))
     return feats
 
@@ -93,8 +93,10 @@ def cmd_fold(args):
     print(f"device {info.get('architecture', '?')}   "
           f"unified {info.get('memory_size', 0)/GB:.0f} GB   "
           f"recommended working set {rec_gb:.2f} GB")
+    from .esm_profile import describe_input
     print(f"dtype={args.dtype}  loops={args.loops}  steps={args.steps}  "
-          f"atoms/token={args.atoms_per_token}  weights=random\n")
+          f"atoms/token={args.atoms_per_token}  weights=random")
+    print(f"input: {describe_input(args)}\n")
     print("== weights resident")
     print(f"  ESMFold2 {w_fold:8.2f} GB")
     print(f"  ESMC     {w_esmc:8.2f} GB")
@@ -106,7 +108,7 @@ def cmd_fold(args):
             print(f"  L={L:<5} SKIPPED: projected peak {projected:.1f} GB "
                   f"exceeds the {cap:.1f} GB cap")
             continue
-        feats = _synth(L, args.atoms_per_token, args.mx_dtype)
+        feats = _synth(L, args)
         lm_kw = dict(asym_id=feats["asym_id"],
                      residue_index=feats["residue_index"],
                      mol_type=feats["mol_type"],

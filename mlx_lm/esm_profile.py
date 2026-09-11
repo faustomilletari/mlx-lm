@@ -59,32 +59,76 @@ DTYPES = {"bfloat16": mx.bfloat16, "float16": mx.float16, "float32": mx.float32}
 # ---------------------------------------------------------------------------
 
 
-def synth_feats(n_tokens: int, atoms_per_token: int = 8, chains: int = 1) -> dict:
-    """Features with the shapes ESMFold2InputBuilder produces, random values."""
+def synth_feats(n_tokens: int, atoms_per_token: int = 8, chains: int = 1,
+                pad_frac: float = 0.0, bonds: bool = False,
+                ligand_frac: float = 0.0, msa_depth: int = 0) -> dict:
+    """Features with the shapes ESMFold2InputBuilder produces, random values.
+
+    Defaults give one unbroken protein chain with no bonds, no ligands, no
+    padding and no MSA, which is the easiest possible input. The other
+    arguments reach paths that default profiling never touches: multi-chain
+    masks, a non-trivial token mask, the token_bonds projection, the ligand
+    branch in the confidence head, and the whole MSA encoder.
+    """
+    from .models.esmfold2 import _NONPOLYMER_ID
+
     n_atoms = n_tokens * atoms_per_token
     a2t = mx.repeat(mx.arange(n_tokens), atoms_per_token)[None]
     per = max(n_tokens // chains, 1)
     chain_id = mx.minimum(mx.arange(n_tokens) // per, chains - 1)[None]
-    return {
+
+    n_real = max(int(n_tokens * (1.0 - pad_frac)), 1)
+    tok_mask = (mx.arange(n_tokens) < n_real)[None]
+    atom_mask = (a2t < n_real)
+
+    mol_type = mx.zeros((1, n_tokens), mx.int32)
+    if ligand_frac > 0:
+        n_lig = max(int(n_tokens * ligand_frac), 1)
+        mol_type = mx.where(mx.arange(n_tokens) >= n_tokens - n_lig,
+                            _NONPOLYMER_ID, 0)[None].astype(mx.int32)
+
+    tb = mx.zeros((1, n_tokens, n_tokens, 1))
+    if bonds:
+        # backbone bonds along the chain, plus one link between each pair of
+        # adjacent chains so the cross-chain path is exercised too
+        i = mx.arange(n_tokens)
+        adj = ((mx.abs(i[:, None] - i[None, :]) == 1)
+               & (chain_id[0][:, None] == chain_id[0][None, :]))
+        link = (i[:, None] == per - 1) & (i[None, :] == per)
+        tb = (adj | link).astype(mx.float32)[None, :, :, None]
+
+    feats = {
         "token_index": mx.arange(n_tokens)[None],
         "residue_index": mx.arange(n_tokens)[None],
         "asym_id": chain_id,
         "entity_id": chain_id,
         "sym_id": mx.zeros((1, n_tokens), mx.int32),
-        "mol_type": mx.zeros((1, n_tokens), mx.int32),
+        "mol_type": mol_type,
         "res_type": mx.random.randint(4, 24, (1, n_tokens)),
         "input_ids": mx.random.randint(4, 24, (1, n_tokens)),
-        "token_bonds": mx.zeros((1, n_tokens, n_tokens, 1)),
-        "token_attention_mask": mx.ones((1, n_tokens), mx.bool_),
+        "token_bonds": tb,
+        "token_attention_mask": tok_mask,
         "ref_pos": mx.random.normal((1, n_atoms, 3)) * 10.0,
-        "ref_element": mx.full((1, n_atoms), 6, mx.int32),
+        "ref_element": mx.where(mx.arange(n_atoms) % 5 == 0, 7, 6)[None]
+                         .astype(mx.int32),
         "ref_charge": mx.zeros((1, n_atoms)),
         "ref_atom_name_chars": mx.random.randint(0, 64, (1, n_atoms, 4)),
         "ref_space_uid": a2t,
-        "atom_attention_mask": mx.ones((1, n_atoms), mx.bool_),
+        "atom_attention_mask": atom_mask,
         "atom_to_token": a2t,
         "distogram_atom_idx": (mx.arange(n_tokens) * atoms_per_token)[None],
     }
+    if msa_depth > 0:
+        m = msa_depth
+        feats["msa"] = mx.random.randint(4, 24, (1, m, n_tokens))
+        feats["msa_attention_mask"] = mx.broadcast_to(
+            tok_mask[:, None, :], (1, m, n_tokens)).astype(mx.bool_)
+        feats["has_deletion"] = (
+            mx.random.uniform(shape=(1, m, n_tokens)) > 0.9).astype(mx.float32)
+        feats["deletion_value"] = (
+            mx.random.uniform(shape=(1, m, n_tokens)) * 2.0)
+        feats["deletion_mean"] = mx.mean(feats["deletion_value"], axis=1)
+    return feats
 
 
 TINY_CONFIG = {
@@ -105,6 +149,28 @@ TINY_CONFIG = {
 }
 
 TINY_ESMC = dict(hidden_size=8, num_attention_heads=2, num_hidden_layers=2)
+
+
+def feats_from_args(L, args):
+    """synth_feats with whatever input complexity the flags ask for."""
+    return synth_feats(L, args.atoms_per_token, args.chains,
+                       pad_frac=getattr(args, "pad_frac", 0.0),
+                       bonds=getattr(args, "bonds", False),
+                       ligand_frac=getattr(args, "ligand_frac", 0.0),
+                       msa_depth=getattr(args, "msa_depth", 0))
+
+
+def describe_input(args):
+    bits = [f"chains={args.chains}"]
+    if getattr(args, "pad_frac", 0.0):
+        bits.append(f"pad={args.pad_frac:.0%}")
+    if getattr(args, "bonds", False):
+        bits.append("bonds")
+    if getattr(args, "ligand_frac", 0.0):
+        bits.append(f"ligands={args.ligand_frac:.0%}")
+    if getattr(args, "msa_depth", 0):
+        bits.append(f"msa_depth={args.msa_depth}")
+    return "  ".join(bits)
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +239,7 @@ def esmc_phases(model, L, args):
 
 def esmfold2_phases(model, L, args):
     feats = {k: (v.astype(args.mx_dtype) if v.dtype in FLOAT else v)
-             for k, v in synth_feats(L, args.atoms_per_token, args.chains).items()}
+             for k, v in feats_from_args(L, args).items()}
     mx.eval(list(feats.values()))
 
     lm_kw = dict(asym_id=feats.get("asym_id"),
@@ -414,6 +480,7 @@ def cmd_esmfold2(args):
     print(f"\nESMFold2  loops={args.loops} steps={args.steps} "
           f"atoms/token={args.atoms_per_token}  dtype={args.dtype}  "
           f"weights={'real' if args.weights else 'random'}")
+    print(f"input: {describe_input(args)}")
     print(f"sweeping L = {args.seq_len}\n")
     rows, per_class, per_layer, raw = sweep(model, esmfold2_phases, args, ceilings)
     _report(rows, per_class, per_layer, args, ceilings,
@@ -897,6 +964,14 @@ def main():
     common.add_argument("--weights", action="store_true",
                         help="load the real checkpoint instead of random init")
     common.add_argument("--chains", type=int, default=1)
+    common.add_argument("--pad-frac", type=float, default=0.0,
+                        help="fraction of trailing tokens masked out")
+    common.add_argument("--bonds", action="store_true",
+                        help="populate token_bonds: backbone plus chain links")
+    common.add_argument("--ligand-frac", type=float, default=0.0,
+                        help="fraction of tokens marked as non-polymer")
+    common.add_argument("--msa-depth", type=int, default=0,
+                        help="MSA rows; >0 runs the MSA encoder")
     common.add_argument("--target", action="append", nargs=3,
                         metavar=("NAME", "GBPS", "TFLOPS"), default=None,
                         help="a chip to test portability against, e.g. "
