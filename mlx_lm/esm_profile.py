@@ -860,6 +860,11 @@ def cmd_trimul(args):
         print(f"\nwrote {args.json}")
 
 
+def _gemm_entry(args):
+    from .esm_gemm_bench import cmd_gemm
+    cmd_gemm(args)
+
+
 def cmd_ceilings(args):
     c = measure_ceilings(dtype=args.mx_dtype, gemm_n=args.gemm_n)
     print(render_ceilings(c))
@@ -937,6 +942,16 @@ def main():
     tm.add_argument("--c-z", type=int, default=256)
     tm.add_argument("--iters", type=int, default=10)
     tm.set_defaults(fn=cmd_trimul)
+
+    gm = sub.add_parser("gemm", parents=[common])
+    gm.add_argument("--seq-len", type=int, nargs="+", default=[500])
+    gm.add_argument("--c-z", type=int, default=256)
+    gm.add_argument("--iters", type=int, default=10)
+    gm.add_argument("--sizes", type=int, nargs="+",
+                    default=[512, 1024, 2048, 4096, 8192])
+    gm.add_argument("--pad-check", type=int, nargs="+",
+                    default=[448, 500, 504, 512, 576])
+    gm.set_defaults(fn=_gemm_entry)
     mi.set_defaults(fn=cmd_micro)
 
     args = p.parse_args()
