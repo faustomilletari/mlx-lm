@@ -296,6 +296,56 @@ On an M5 Ultra the transposes are memory-bound while the GEMMs are
 compute-bound, so their share roughly doubles to **~11%**. The case is better
 on the target than on the proxy.
 
+## TriMul phase 2: channel-first layout
+
+Section E2 of the trimul bench, L=500, bf16:
+
+| variant | ms |
+|---|---|
+| gating + contraction, old layout, compiled | 43.02 |
+| gating + contraction, channel-first, compiled | **38.22 (0.89x)** |
+| `x @ W.T` -> (M=250000, N=1024) | 22.86 |
+| `W @ x.T` -> (M=1024, N=250000) | 22.06 (0.96x) |
+| `(B,i,j,C)` in: permute + matmul | 18.14 |
+| `(C,B,i,j)` in: batch permute only | **11.88 (0.65x)** |
+
+The feared risk did not materialise: flipping the GEMM orientation is neutral
+(3.5%, inside noise), while removing the two copies is worth 34.5% on the
+contraction.
+
+### Paired A/B on a production trunk
+
+`devtools/ab_trimul_layout.py 500 5`. Both variants in one process,
+alternating, because the expected ~5% gain sits on the cross-session noise
+floor. 24 blocks x 4 passes = 192 TriMul calls per measurement.
+
+| pair | old | new | ratio |
+|---|---|---|---|
+| 1 | 18.768s | 17.887s | 1.049x |
+| 2 | 18.786s | 17.774s | 1.057x |
+| 3 | 18.759s | 17.682s | 1.061x |
+| 4 | 18.905s | 17.721s | 1.067x |
+| 5 | 18.805s | 17.681s | 1.064x |
+| **median** | 18.786s | 17.721s | **1.061x, 5.7%** |
+
+Output bit-identical, max abs diff 0.000e+00. Ratio spread 1.7%, stdev 0.0068.
+Every pair favours the new layout.
+
+**Why pairing was necessary:** absolute times vary 0.8% within a session and
+~4% across sessions, against a 5.7% effect. The ratio is stable because drift
+hits both halves of a pair equally.
+
+Predicted 4.9% from E2, measured 5.7%. Pessimistic by 16% this time, after
+being optimistic by ~33% twice.
+
+## Cumulative
+
+| Stage | trunk at L=500 | vs fp32 |
+|---|---|---|
+| fp32 baseline (`8a8efde`) | 26.062s | — |
+| + bf16 trunk + contraction | 20.052s | 1.300x |
+| + channel-first TriMul | **~18.90s** | **~1.379x** |
+
 ## Harness bugs that invalidated earlier numbers
 
 Read this before comparing against anything older than the commit named.
