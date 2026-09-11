@@ -10,6 +10,7 @@ libraries are absent).
 """
 
 import math
+import os
 import warnings
 from typing import Optional
 
@@ -156,10 +157,28 @@ class FoldingTrunk(nn.Module):
         return pair
 
     def __call__(self, pair: mx.array, mask: Optional[mx.array] = None) -> mx.array:
+        # Run the block stack in bf16, mirroring the reference FoldingTrunk:
+        # cast in at the trunk boundary, cast back to the caller's dtype on
+        # return, so the outer residual still accumulates in fp32 the way
+        # `pair.add_(pair_delta.float())` does there.
+        #
+        # Reaching here in fp32 is not a bug, it is what the reference does off
+        # CUDA -- both its autocast and its internal cast are gated on
+        # `pair.is_cuda`. But fp32 doubles every byte the pair stack moves, and
+        # the stack is bandwidth-bound outside the GEMMs.
+        #
+        # The mask has to come along. `routed * mask[..., None]` in TriMul
+        # would promote the whole product back to fp32 if the mask stayed
+        # fp32, silently undoing the cast.
+        orig_dtype = pair.dtype
+        if _BF16_TRUNK and orig_dtype != mx.bfloat16:
+            pair = pair.astype(mx.bfloat16)
+            if mask is not None:
+                mask = mask.astype(mx.bfloat16)
         # mx.compile needs array arguments, so an absent mask takes the raw path.
-        if mask is None:
-            return self._apply_blocks(pair, None)
-        return self._compiled(pair, mask)
+        out = self._apply_blocks(pair, None) if mask is None \
+            else self._compiled(pair, mask)
+        return out if out.dtype == orig_dtype else out.astype(orig_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +302,10 @@ _RMS_EPS_F32 = 1.1920929e-07
 
 # The reference forces bf16 inside the SWA atom attention.
 _SWA_DTYPE = mx.bfloat16
+
+# Run the FoldingTrunk block stack in bf16. Set MLX_ESMFOLD2_BF16_TRUNK=0 to
+# A/B against the fp32 path. Collapse this to unconditional before merging.
+_BF16_TRUNK = os.environ.get("MLX_ESMFOLD2_BF16_TRUNK", "1") not in ("0", "false")
 
 
 def _rms_norm(x: mx.array, eps: float = _RMS_EPS_F32) -> mx.array:
